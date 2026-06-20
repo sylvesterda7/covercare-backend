@@ -4,6 +4,7 @@ const puppeteer = require("puppeteer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || "dev-key-123";
 
 app.use(cors());
 app.use(express.json());
@@ -15,7 +16,15 @@ app.get("/", (req, res) => {
 
 // ── Verification route ──
 app.get("/verify", async (req, res) => {
-  const { registration_number, name } = req.query;
+  const { registration_number, name, api_key } = req.query;
+
+  // ── Check API key ──
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized. Invalid API key."
+    });
+  }
 
   // ── Validation ──
   if (!registration_number) {
