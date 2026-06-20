@@ -1,10 +1,17 @@
 const express = require("express");
 const cors = require("cors");
 const puppeteer = require("puppeteer");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "dev-key-123";
+
+// ── Supabase client ──
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
 app.use(cors());
 app.use(express.json());
@@ -14,11 +21,176 @@ app.get("/", (req, res) => {
   res.json({ message: "CoverCare Africa Backend is running." });
 });
 
-// ── Verification route ──
+// ── Save worker signup ──
+app.post("/worker", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized."
+    });
+  }
+
+  const {
+    full_name,
+    email,
+    phone,
+    role,
+    license_number,
+    license_verified,
+    city,
+    experience
+  } = req.body;
+
+  const { data, error } = await supabase
+    .from("workers")
+    .insert([{
+      full_name,
+      email,
+      phone,
+      role,
+      license_number,
+      license_verified,
+      city,
+      experience
+    }]);
+
+  if (error) {
+    console.error("Worker save error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save worker.",
+      error: error.message
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: "Worker saved successfully."
+  });
+});
+
+// ── Save facility signup ──
+app.post("/facility", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized."
+    });
+  }
+
+  const {
+    facility_name,
+    facility_type,
+    city,
+    contact_name,
+    contact_role,
+    email,
+    phone,
+    staff_needs,
+    frequency
+  } = req.body;
+
+  const { data, error } = await supabase
+    .from("facilities")
+    .insert([{
+      facility_name,
+      facility_type,
+      city,
+      contact_name,
+      contact_role,
+      email,
+      phone,
+      staff_needs,
+      frequency
+    }]);
+
+  if (error) {
+    console.error("Facility save error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save facility.",
+      error: error.message
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: "Facility saved successfully."
+  });
+});
+
+// ── Save shift posting ──
+app.post("/shift", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized."
+    });
+  }
+
+  const {
+    facility_name,
+    facility_type,
+    city,
+    contact_name,
+    contact_email,
+    contact_phone,
+    role_needed,
+    shift_date,
+    start_time,
+    duration,
+    pay_rate,
+    total_pay,
+    experience_required,
+    urgency,
+    notes
+  } = req.body;
+
+  const { data, error } = await supabase
+    .from("shifts")
+    .insert([{
+      facility_name,
+      facility_type,
+      city,
+      contact_name,
+      contact_email,
+      contact_phone,
+      role_needed,
+      shift_date,
+      start_time,
+      duration,
+      pay_rate,
+      total_pay,
+      experience_required,
+      urgency,
+      notes
+    }]);
+
+  if (error) {
+    console.error("Shift save error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save shift.",
+      error: error.message
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: "Shift saved successfully."
+  });
+});
+
+// ── Verify pharmacist license ──
 app.get("/verify", async (req, res) => {
   const { registration_number, name, api_key } = req.query;
 
-  // ── Check API key ──
   if (api_key !== API_KEY) {
     return res.status(401).json({
       success: false,
@@ -26,7 +198,6 @@ app.get("/verify", async (req, res) => {
     });
   }
 
-  // ── Validation ──
   if (!registration_number) {
     return res.status(400).json({
       success: false,
@@ -43,7 +214,6 @@ app.get("/verify", async (req, res) => {
 
   console.log(`Verifying: ${registration_number} for ${name}`);
 
-  // ── Prepare name parts for matching ──
   const nameParts = name.toLowerCase().trim().split(" ");
   const firstName = nameParts[0] || "";
   const lastName = nameParts[nameParts.length - 1] || "";
@@ -51,7 +221,6 @@ app.get("/verify", async (req, res) => {
   let browser;
 
   try {
-    // ── Launch headless Chrome ──
     browser = await puppeteer.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -59,16 +228,13 @@ app.get("/verify", async (req, res) => {
 
     const page = await browser.newPage();
 
-    // ── Navigate to Pharmacy Council search page ──
     await page.goto("https://forms.pcghana.org/#/search", {
       waitUntil: "networkidle2",
       timeout: 15000
     });
 
-    // ── Wait for Angular app to fully render ──
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // ── Get dropdown options ──
     await page.waitForSelector("select", { timeout: 10000 });
 
     const options = await page.evaluate(() => {
@@ -80,69 +246,45 @@ app.get("/verify", async (req, res) => {
       }));
     });
 
-    console.log("Dropdown options:", options);
-
-    // ── Select Pharmacists from dropdown ──
     const pharmacistOption = options.find(o =>
       o.text.toLowerCase().includes("pharmacist")
     );
 
     if (pharmacistOption) {
       await page.select("select", pharmacistOption.value);
-      console.log("Selected:", pharmacistOption.text);
-    } else {
-      console.log("Pharmacist option not found in dropdown");
     }
 
-    // ── Wait for page to update ──
     await new Promise(resolve => setTimeout(resolve, 1500));
 
-    // ── Type registration number into search field ──
     await page.waitForSelector("input[type='text']", { timeout: 10000 });
     await page.click("input[type='text']", { clickCount: 3 });
     await page.type("input[type='text']", registration_number);
-    console.log("Typed:", registration_number);
 
-    // ── Press Enter to search ──
     await page.keyboard.press("Enter");
-    console.log("Pressed Enter to search");
 
-    // ── Wait for results to load ──
     await new Promise(resolve => setTimeout(resolve, 6000));
 
-    // ── Read page text ──
     const resultText = await page.evaluate(() => {
       return document.body.innerText.toLowerCase();
     });
 
-    console.log("Result snippet:", resultText.substring(0, 500));
-
     await browser.close();
 
-    // ── Step 1: confirm a result row exists ──
     const hasResultRow =
       resultText.includes("no results") === false &&
       /\d+\s+\w+\s+\w+/.test(resultText);
 
-    // ── Step 2: confirm name matches ──
     const nameMatches =
       resultText.includes(firstName) ||
       resultText.includes(lastName);
-
-    // ── Step 3: confirm registration number appears in result ──
-    const numberMatches = resultText.includes(
-      registration_number.toLowerCase().replace(" ", "")
-    );
 
     const hasResults = hasResultRow && nameMatches;
 
     console.log("Has result row:", hasResultRow);
     console.log("Name matches:", nameMatches);
-    console.log("Number in result:", numberMatches);
     console.log("First name checked:", firstName);
     console.log("Last name checked:", lastName);
 
-    // ── Return result ──
     if (hasResults) {
       return res.json({
         success: true,
@@ -155,10 +297,9 @@ app.get("/verify", async (req, res) => {
         }
       });
     } else if (hasResultRow && !nameMatches) {
-      // Number exists but name doesn't match
       return res.json({
         success: false,
-        message: "Registration number found but name does not match Council records. Please check your details.",
+        message: "Registration number found but name does not match Council records.",
         data: {
           status: "name_mismatch",
           registration_number: registration_number,
