@@ -376,6 +376,145 @@ const { data, error } = await supabase
     data
   });
 });
+// ── Initialize Paystack payment ──
+app.post("/payment/initialize", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized."
+    });
+  }
+
+  const { email, amount, shift_data } = req.body;
+
+  if (!email || !amount) {
+    return res.status(400).json({
+      success: false,
+      message: "Email and amount are required."
+    });
+  }
+
+  try {
+    // ── Initialize transaction with Paystack ──
+    const response = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        email,
+        amount: Math.round(amount * 100), // Paystack uses pesewas
+        currency: "GHS",
+        metadata: {
+          shift_data: JSON.stringify(shift_data)
+        }
+      })
+    });
+
+    const data = await response.json();
+
+    if (!data.status) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment initialization failed.",
+        error: data.message
+      });
+    }
+
+    return res.json({
+      success: true,
+      authorization_url: data.data.authorization_url,
+      access_code: data.data.access_code,
+      reference: data.data.reference
+    });
+
+  } catch (err) {
+    console.error("Payment error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Payment service unavailable.",
+      error: err.message
+    });
+  }
+});
+
+// ── Verify Paystack payment ──
+app.post("/payment/verify", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized."
+    });
+  }
+
+  const { reference } = req.body;
+
+  if (!reference) {
+    return res.status(400).json({
+      success: false,
+      message: "Payment reference is required."
+    });
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.paystack.co/transaction/verify/${reference}`,
+      {
+        headers: {
+          "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!data.status || data.data.status !== "success") {
+      return res.status(400).json({
+        success: false,
+        message: "Payment verification failed."
+      });
+    }
+
+    // ── Payment verified — save shift to database ──
+    const metadata = data.data.metadata;
+    const shift_data = metadata.shift_data ? JSON.parse(metadata.shift_data) : null;
+
+    if (shift_data) {
+      const { error } = await supabase
+        .from("shifts")
+        .insert([{
+          ...shift_data,
+          payment_reference: reference,
+          payment_status: "paid",
+          status: "open"
+        }]);
+
+      if (error) {
+        console.error("Shift save error after payment:", error);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: "Payment verified successfully.",
+      amount: data.data.amount / 100,
+      reference
+    });
+
+  } catch (err) {
+    console.error("Verification error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Verification service unavailable.",
+      error: err.message
+    });
+  }
+});
 // ── Start server ──
 app.listen(PORT, () => {
   console.log(`CoverCare backend running on http://localhost:${PORT}`);
