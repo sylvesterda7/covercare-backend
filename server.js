@@ -10,7 +10,7 @@ const API_KEY = process.env.API_KEY || "dev-key-123";
 // ── Supabase client ──
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_KEY
 );
 
 app.use(cors());
