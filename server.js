@@ -328,7 +328,54 @@ app.get("/verify", async (req, res) => {
     });
   }
 });
+// ── Update identity verified status ──
+app.post("/verify-identity", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
 
+  if (api_key !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized."
+    });
+  }
+
+  const { email, selfie_url, id_document_url } = req.body;
+
+if (!email) {
+  return res.status(400).json({
+    success: false,
+    message: "Email is required."
+  });
+}
+
+const updateData = {
+  identity_verified: true,
+  identity_verified_at: new Date().toISOString()
+};
+
+if (selfie_url) updateData.selfie_url = selfie_url;
+if (id_document_url) updateData.id_document_url = id_document_url;
+
+const { data, error } = await supabase
+  .from("workers")
+  .update(updateData)
+  .eq("email", email)
+  .select();
+
+  if (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update identity status.",
+      error: error.message
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: "Identity verified successfully.",
+    data
+  });
+});
 // ── Start server ──
 app.listen(PORT, () => {
   console.log(`CoverCare backend running on http://localhost:${PORT}`);
