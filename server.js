@@ -3,6 +3,7 @@ const cors = require("cors");
 const puppeteer = require("puppeteer");
 const { createClient } = require("@supabase/supabase-js");
 
+// ── App setup ──
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "dev-key-123";
@@ -13,8 +14,65 @@ const supabase = createClient(
   process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_KEY
 );
 
-app.use(cors());
+// ── CORS — only allow our frontend ──
+app.use(cors({
+  origin: [
+    "https://covercare-africa.vercel.app",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500"
+  ],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-api-key"]
+}));
+
 app.use(express.json());
+
+// ── Security headers ──
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
+
+// ── Input sanitization ──
+function sanitize(str) {
+  if (!str) return "";
+  return str.toString().replace(/[<>'";&]/g, "").trim().substring(0, 200);
+}
+
+// ── Rate limiting ──
+const rateLimit = {};
+
+function checkRateLimit(ip, maxRequests = 10, windowMs = 60000) {
+  const now = Date.now();
+  if (!rateLimit[ip]) {
+    rateLimit[ip] = { count: 1, start: now };
+    return true;
+  }
+  const window = rateLimit[ip];
+  if (now - window.start > windowMs) {
+    rateLimit[ip] = { count: 1, start: now };
+    return true;
+  }
+  if (window.count >= maxRequests) {
+    return false;
+  }
+  window.count++;
+  return true;
+}
+
+// ── Logger ──
+function log(level, message, data = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...data
+  };
+  console.log(JSON.stringify(entry));
+}
 
 // ── Health check ──
 app.get("/", (req, res) => {
@@ -24,40 +82,30 @@ app.get("/", (req, res) => {
 // ── Save worker signup ──
 app.post("/worker", async (req, res) => {
   const api_key = req.headers["x-api-key"];
-
   if (api_key !== API_KEY) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized."
-    });
+    return res.status(401).json({ success: false, message: "Unauthorized." });
   }
 
+  // Sanitize inputs
+  const body = req.body;
+  Object.keys(body).forEach(key => {
+    if (typeof body[key] === "string") body[key] = sanitize(body[key]);
+  });
+
   const {
-    full_name,
-    email,
-    phone,
-    role,
-    license_number,
-    license_verified,
-    city,
-    experience
-  } = req.body;
+    full_name, email, phone, role,
+    license_number, license_verified, city, experience
+  } = body;
 
   const { data, error } = await supabase
     .from("workers")
     .insert([{
-      full_name,
-      email,
-      phone,
-      role,
-      license_number,
-      license_verified,
-      city,
-      experience
+      full_name, email, phone, role,
+      license_number, license_verified, city, experience
     }]);
 
   if (error) {
-    console.error("Worker save error:", error);
+    log("error", "Worker save error", { error: error.message });
     return res.status(500).json({
       success: false,
       message: "Failed to save worker.",
@@ -65,51 +113,36 @@ app.post("/worker", async (req, res) => {
     });
   }
 
-  return res.json({
-    success: true,
-    message: "Worker saved successfully."
-  });
+  log("info", "Worker saved", { email });
+  return res.json({ success: true, message: "Worker saved successfully." });
 });
 
 // ── Save facility signup ──
 app.post("/facility", async (req, res) => {
   const api_key = req.headers["x-api-key"];
-
   if (api_key !== API_KEY) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized."
-    });
+    return res.status(401).json({ success: false, message: "Unauthorized." });
   }
 
+  const body = req.body;
+  Object.keys(body).forEach(key => {
+    if (typeof body[key] === "string") body[key] = sanitize(body[key]);
+  });
+
   const {
-    facility_name,
-    facility_type,
-    city,
-    contact_name,
-    contact_role,
-    email,
-    phone,
-    staff_needs,
-    frequency
-  } = req.body;
+    facility_name, facility_type, city, contact_name,
+    contact_role, email, phone, staff_needs, frequency
+  } = body;
 
   const { data, error } = await supabase
     .from("facilities")
     .insert([{
-      facility_name,
-      facility_type,
-      city,
-      contact_name,
-      contact_role,
-      email,
-      phone,
-      staff_needs,
-      frequency
+      facility_name, facility_type, city, contact_name,
+      contact_role, email, phone, staff_needs, frequency
     }]);
 
   if (error) {
-    console.error("Facility save error:", error);
+    log("error", "Facility save error", { error: error.message });
     return res.status(500).json({
       success: false,
       message: "Failed to save facility.",
@@ -117,63 +150,40 @@ app.post("/facility", async (req, res) => {
     });
   }
 
-  return res.json({
-    success: true,
-    message: "Facility saved successfully."
-  });
+  log("info", "Facility saved", { facility_name });
+  return res.json({ success: true, message: "Facility saved successfully." });
 });
 
 // ── Save shift posting ──
 app.post("/shift", async (req, res) => {
   const api_key = req.headers["x-api-key"];
-
   if (api_key !== API_KEY) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized."
-    });
+    return res.status(401).json({ success: false, message: "Unauthorized." });
   }
 
+  const body = req.body;
+  Object.keys(body).forEach(key => {
+    if (typeof body[key] === "string") body[key] = sanitize(body[key]);
+  });
+
   const {
-    facility_name,
-    facility_type,
-    city,
-    contact_name,
-    contact_email,
-    contact_phone,
-    role_needed,
-    shift_date,
-    start_time,
-    duration,
-    pay_rate,
-    total_pay,
-    experience_required,
-    urgency,
-    notes
-  } = req.body;
+    facility_name, facility_type, city, contact_name,
+    contact_email, contact_phone, role_needed, shift_date,
+    start_time, duration, pay_rate, total_pay,
+    experience_required, urgency, notes
+  } = body;
 
   const { data, error } = await supabase
     .from("shifts")
     .insert([{
-      facility_name,
-      facility_type,
-      city,
-      contact_name,
-      contact_email,
-      contact_phone,
-      role_needed,
-      shift_date,
-      start_time,
-      duration,
-      pay_rate,
-      total_pay,
-      experience_required,
-      urgency,
-      notes
+      facility_name, facility_type, city, contact_name,
+      contact_email, contact_phone, role_needed, shift_date,
+      start_time, duration, pay_rate, total_pay,
+      experience_required, urgency, notes
     }]);
 
   if (error) {
-    console.error("Shift save error:", error);
+    log("error", "Shift save error", { error: error.message });
     return res.status(500).json({
       success: false,
       message: "Failed to save shift.",
@@ -181,15 +191,25 @@ app.post("/shift", async (req, res) => {
     });
   }
 
-  return res.json({
-    success: true,
-    message: "Shift saved successfully."
-  });
+  log("info", "Shift saved", { facility_name, role_needed });
+  return res.json({ success: true, message: "Shift saved successfully." });
 });
 
 // ── Verify pharmacist license ──
 app.get("/verify", async (req, res) => {
-  const { registration_number, name, api_key } = req.query;
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+
+  // ── Rate limit — max 5 verifications per minute per IP ──
+  if (!checkRateLimit(ip, 5, 60000)) {
+    return res.status(429).json({
+      success: false,
+      message: "Too many verification requests. Please wait a minute and try again."
+    });
+  }
+
+  const registration_number = sanitize(req.query.registration_number);
+  const name = sanitize(req.query.name);
+  const api_key = req.query.api_key;
 
   if (api_key !== API_KEY) {
     return res.status(401).json({
@@ -212,7 +232,7 @@ app.get("/verify", async (req, res) => {
     });
   }
 
-  console.log(`Verifying: ${registration_number} for ${name}`);
+  log("info", "Verifying license", { registration_number, name });
 
   const nameParts = name.toLowerCase().trim().split(" ");
   const firstName = nameParts[0] || "";
@@ -234,16 +254,12 @@ app.get("/verify", async (req, res) => {
     });
 
     await new Promise(resolve => setTimeout(resolve, 3000));
-
     await page.waitForSelector("select", { timeout: 10000 });
 
     const options = await page.evaluate(() => {
       const select = document.querySelector("select");
       if (!select) return [];
-      return Array.from(select.options).map(o => ({
-        value: o.value,
-        text: o.text
-      }));
+      return Array.from(select.options).map(o => ({ value: o.value, text: o.text }));
     });
 
     const pharmacistOption = options.find(o =>
@@ -255,13 +271,10 @@ app.get("/verify", async (req, res) => {
     }
 
     await new Promise(resolve => setTimeout(resolve, 1500));
-
     await page.waitForSelector("input[type='text']", { timeout: 10000 });
     await page.click("input[type='text']", { clickCount: 3 });
     await page.type("input[type='text']", registration_number);
-
     await page.keyboard.press("Enter");
-
     await new Promise(resolve => setTimeout(resolve, 6000));
 
     const resultText = await page.evaluate(() => {
@@ -280,10 +293,11 @@ app.get("/verify", async (req, res) => {
 
     const hasResults = hasResultRow && nameMatches;
 
-    console.log("Has result row:", hasResultRow);
-    console.log("Name matches:", nameMatches);
-    console.log("First name checked:", firstName);
-    console.log("Last name checked:", lastName);
+    log("info", "Verification result", {
+      registration_number,
+      hasResultRow,
+      nameMatches
+    });
 
     if (hasResults) {
       return res.json({
@@ -291,7 +305,7 @@ app.get("/verify", async (req, res) => {
         message: "License verified in good standing with the Pharmacy Council.",
         data: {
           status: "verified_good",
-          registration_number: registration_number,
+          registration_number,
           name_verified: name,
           source: "Pharmacy Council Ghana"
         }
@@ -302,7 +316,7 @@ app.get("/verify", async (req, res) => {
         message: "Registration number found but name does not match Council records.",
         data: {
           status: "name_mismatch",
-          registration_number: registration_number,
+          registration_number,
           source: "Pharmacy Council Ghana"
         }
       });
@@ -312,7 +326,7 @@ app.get("/verify", async (req, res) => {
         message: "Registration number not found in Pharmacy Council records.",
         data: {
           status: "not_found",
-          registration_number: registration_number,
+          registration_number,
           source: "Pharmacy Council Ghana"
         }
       });
@@ -320,7 +334,7 @@ app.get("/verify", async (req, res) => {
 
   } catch (err) {
     if (browser) await browser.close();
-    console.error("Verification error:", err.message);
+    log("error", "Verification error", { error: err.message });
     return res.status(500).json({
       success: false,
       message: "Verification service temporarily unavailable.",
@@ -328,41 +342,41 @@ app.get("/verify", async (req, res) => {
     });
   }
 });
+
 // ── Update identity verified status ──
 app.post("/verify-identity", async (req, res) => {
   const api_key = req.headers["x-api-key"];
-
   if (api_key !== API_KEY) {
-    return res.status(401).json({
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const email = sanitize(req.body.email);
+  const selfie_url = req.body.selfie_url;
+  const id_document_url = req.body.id_document_url;
+
+  if (!email) {
+    return res.status(400).json({
       success: false,
-      message: "Unauthorized."
+      message: "Email is required."
     });
   }
 
-  const { email, selfie_url, id_document_url } = req.body;
+  const updateData = {
+    identity_verified: true,
+    identity_verified_at: new Date().toISOString()
+  };
 
-if (!email) {
-  return res.status(400).json({
-    success: false,
-    message: "Email is required."
-  });
-}
+  if (selfie_url) updateData.selfie_url = selfie_url;
+  if (id_document_url) updateData.id_document_url = id_document_url;
 
-const updateData = {
-  identity_verified: true,
-  identity_verified_at: new Date().toISOString()
-};
-
-if (selfie_url) updateData.selfie_url = selfie_url;
-if (id_document_url) updateData.id_document_url = id_document_url;
-
-const { data, error } = await supabase
-  .from("workers")
-  .update(updateData)
-  .eq("email", email)
-  .select();
+  const { data, error } = await supabase
+    .from("workers")
+    .update(updateData)
+    .eq("email", email)
+    .select();
 
   if (error) {
+    log("error", "Identity update error", { error: error.message });
     return res.status(500).json({
       success: false,
       message: "Failed to update identity status.",
@@ -370,24 +384,24 @@ const { data, error } = await supabase
     });
   }
 
+  log("info", "Identity verified", { email });
   return res.json({
     success: true,
     message: "Identity verified successfully.",
     data
   });
 });
+
 // ── Initialize Paystack payment ──
 app.post("/payment/initialize", async (req, res) => {
   const api_key = req.headers["x-api-key"];
-
   if (api_key !== API_KEY) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized."
-    });
+    return res.status(401).json({ success: false, message: "Unauthorized." });
   }
 
-  const { email, amount, shift_data } = req.body;
+  const email = sanitize(req.body.email);
+  const amount = parseFloat(req.body.amount);
+  const shift_data = req.body.shift_data;
 
   if (!email || !amount) {
     return res.status(400).json({
@@ -397,7 +411,6 @@ app.post("/payment/initialize", async (req, res) => {
   }
 
   try {
-    // ── Initialize transaction with Paystack ──
     const response = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
@@ -406,7 +419,7 @@ app.post("/payment/initialize", async (req, res) => {
       },
       body: JSON.stringify({
         email,
-        amount: Math.round(amount * 100), // Paystack uses pesewas
+        amount: Math.round(amount * 100),
         currency: "GHS",
         metadata: {
           shift_data: JSON.stringify(shift_data)
@@ -417,6 +430,7 @@ app.post("/payment/initialize", async (req, res) => {
     const data = await response.json();
 
     if (!data.status) {
+      log("error", "Paystack init failed", { error: data.message });
       return res.status(400).json({
         success: false,
         message: "Payment initialization failed.",
@@ -424,6 +438,7 @@ app.post("/payment/initialize", async (req, res) => {
       });
     }
 
+    log("info", "Payment initialized", { email, amount, reference: data.data.reference });
     return res.json({
       success: true,
       authorization_url: data.data.authorization_url,
@@ -432,7 +447,7 @@ app.post("/payment/initialize", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Payment error:", err);
+    log("error", "Payment init error", { error: err.message });
     return res.status(500).json({
       success: false,
       message: "Payment service unavailable.",
@@ -444,15 +459,11 @@ app.post("/payment/initialize", async (req, res) => {
 // ── Verify Paystack payment ──
 app.post("/payment/verify", async (req, res) => {
   const api_key = req.headers["x-api-key"];
-
   if (api_key !== API_KEY) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized."
-    });
+    return res.status(401).json({ success: false, message: "Unauthorized." });
   }
 
-  const { reference } = req.body;
+  const reference = sanitize(req.body.reference);
 
   if (!reference) {
     return res.status(400).json({
@@ -474,13 +485,14 @@ app.post("/payment/verify", async (req, res) => {
     const data = await response.json();
 
     if (!data.status || data.data.status !== "success") {
+      log("error", "Payment verification failed", { reference });
       return res.status(400).json({
         success: false,
         message: "Payment verification failed."
       });
     }
 
-    // ── Payment verified — save shift to database ──
+    // ── Save shift to database after payment ──
     const metadata = data.data.metadata;
     const shift_data = metadata.shift_data ? JSON.parse(metadata.shift_data) : null;
 
@@ -495,10 +507,11 @@ app.post("/payment/verify", async (req, res) => {
         }]);
 
       if (error) {
-        console.error("Shift save error after payment:", error);
+        log("error", "Shift save error after payment", { error: error.message });
       }
     }
 
+    log("info", "Payment verified", { reference, amount: data.data.amount / 100 });
     return res.json({
       success: true,
       message: "Payment verified successfully.",
@@ -507,7 +520,7 @@ app.post("/payment/verify", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Verification error:", err);
+    log("error", "Payment verify error", { error: err.message });
     return res.status(500).json({
       success: false,
       message: "Verification service unavailable.",
@@ -515,7 +528,8 @@ app.post("/payment/verify", async (req, res) => {
     });
   }
 });
+
 // ── Start server ──
 app.listen(PORT, () => {
-  console.log(`CoverCare backend running on http://localhost:${PORT}`);
+  log("info", "Server started", { port: PORT });
 });
