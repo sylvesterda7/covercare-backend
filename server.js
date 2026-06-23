@@ -695,6 +695,42 @@ app.post("/shift/accept", async (req, res) => {
   }
 
   if (shift.status !== "open") {
+    if (
+      shift.worker_id === workerId &&
+      ["accepted", "in_progress"].includes(shift.status)
+    ) {
+      let qrToken = shift.qr_token;
+      let shiftRecord = shift;
+
+      if (!qrToken) {
+        qrToken = generateQrToken();
+        const { data: updated, error: updateError } = await supabase
+          .from("shifts")
+          .update({ qr_token: qrToken })
+          .eq("id", shiftId)
+          .select()
+          .single();
+
+        if (updateError) {
+          log("error", "QR token regenerate error", { error: updateError.message });
+          return res.status(500).json({
+            success: false,
+            message: "Failed to generate QR code."
+          });
+        }
+        shiftRecord = updated;
+      }
+
+      log("info", "Shift already accepted — returning QR", { shiftId, workerId });
+      return res.json({
+        success: true,
+        message: "Shift already accepted.",
+        qr_url: buildQrUrl(shiftId, workerId, qrToken),
+        qr_token: qrToken,
+        shift: shiftRecord
+      });
+    }
+
     return res.status(400).json({
       success: false,
       message: "This shift is no longer available."
