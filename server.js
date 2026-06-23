@@ -26,7 +26,7 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "x-api-key"]
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 // ── Security headers ──
 app.use((req, res, next) => {
@@ -75,6 +75,57 @@ function log(level, message, data = {}) {
   console.log(JSON.stringify(entry));
 }
 
+function requireApiKey(req, res) {
+  if (req.headers["x-api-key"] !== API_KEY) {
+    res.status(401).json({ success: false, message: "Unauthorized." });
+    return false;
+  }
+  return true;
+}
+
+function rateLimitRoute(req, res, max = 30) {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  if (!checkRateLimit(ip, max, 60000)) {
+    res.status(429).json({
+      success: false,
+      message: "Too many requests. Please try again shortly."
+    });
+    return false;
+  }
+  return true;
+}
+
+const SHIFT_FIELDS = [
+  "facility_name", "facility_type", "city", "contact_name",
+  "contact_email", "contact_phone", "role_needed", "shift_date",
+  "start_time", "duration", "pay_rate", "total_pay",
+  "experience_required", "urgency", "notes"
+];
+
+function pickShiftFields(data) {
+  if (!data || typeof data !== "object") return {};
+  const picked = {};
+  SHIFT_FIELDS.forEach((key) => {
+    if (data[key] !== undefined && data[key] !== null) {
+      picked[key] = typeof data[key] === "string" ? sanitize(data[key]) : data[key];
+    }
+  });
+  return picked;
+}
+
+function computeShiftAmounts(shiftData) {
+  const hours = parseFloat(String(shiftData.duration || "").replace(/[^0-9.]/g, "")) || 0;
+  const rate = parseFloat(String(shiftData.pay_rate || "").replace(/[^0-9.]/g, "")) || 0;
+  const workerTotal = Math.round(rate * hours * 100) / 100;
+  const facilityTotal = Math.round(workerTotal * 1.25 * 100) / 100;
+  return { hours, rate, workerTotal, facilityTotal };
+}
+
+function isPharmacyRole(role) {
+  const r = (role || "").toLowerCase();
+  return r.includes("pharmacist") || r.includes("pharmacy");
+}
+
 // ── Health check ──
 app.get("/", (req, res) => {
   res.json({ message: "CoverCare Africa Backend is running." });
@@ -82,12 +133,8 @@ app.get("/", (req, res) => {
 
 // ── Save worker signup ──
 app.post("/worker", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 20)) return;
 
-  // Sanitize inputs
   const body = req.body;
   Object.keys(body).forEach(key => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
@@ -95,14 +142,23 @@ app.post("/worker", async (req, res) => {
 
   const {
     full_name, email, phone, role,
-    license_number, license_verified, city, experience
+    license_number, city, experience
   } = body;
+
+  if (!full_name || !email || !phone || !role || !city) {
+    return res.status(400).json({
+      success: false,
+      message: "full_name, email, phone, role, and city are required."
+    });
+  }
 
   const { data, error } = await supabase
     .from("workers")
     .insert([{
       full_name, email, phone, role,
-      license_number, license_verified, city, experience
+      license_number,
+      license_verified: false,
+      city, experience
     }]);
 
   if (error) {
@@ -120,10 +176,7 @@ app.post("/worker", async (req, res) => {
 
 // ── Save facility signup ──
 app.post("/facility", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 20)) return;
 
   const body = req.body;
   Object.keys(body).forEach(key => {
@@ -155,45 +208,14 @@ app.post("/facility", async (req, res) => {
   return res.json({ success: true, message: "Facility saved successfully." });
 });
 
-// ── Save shift posting ──
+// ── Save shift posting (deprecated — use payment flow) ──
 app.post("/shift", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
-
-  const body = req.body;
-  Object.keys(body).forEach(key => {
-    if (typeof body[key] === "string") body[key] = sanitize(body[key]);
+  if (!requireApiKey(req, res)) return;
+  log("warn", "Blocked direct shift creation attempt", { ip: req.ip });
+  return res.status(403).json({
+    success: false,
+    message: "Direct shift creation is disabled. Post shifts through the payment flow."
   });
-
-  const {
-    facility_name, facility_type, city, contact_name,
-    contact_email, contact_phone, role_needed, shift_date,
-    start_time, duration, pay_rate, total_pay,
-    experience_required, urgency, notes
-  } = body;
-
-  const { data, error } = await supabase
-    .from("shifts")
-    .insert([{
-      facility_name, facility_type, city, contact_name,
-      contact_email, contact_phone, role_needed, shift_date,
-      start_time, duration, pay_rate, total_pay,
-      experience_required, urgency, notes
-    }]);
-
-  if (error) {
-    log("error", "Shift save error", { error: error.message });
-    return res.status(500).json({
-      success: false,
-      message: "Failed to save shift.",
-      error: error.message
-    });
-  }
-
-  log("info", "Shift saved", { facility_name, role_needed });
-  return res.json({ success: true, message: "Shift saved successfully." });
 });
 
 // ── Verify pharmacist license ──
@@ -210,7 +232,7 @@ app.get("/verify", async (req, res) => {
 
   const registration_number = sanitize(req.query.registration_number);
   const name = sanitize(req.query.name);
-  const api_key = req.query.api_key;
+  const api_key = req.headers["x-api-key"] || req.query.api_key;
 
   if (api_key !== API_KEY) {
     return res.status(401).json({
@@ -346,10 +368,7 @@ app.get("/verify", async (req, res) => {
 
 // ── Update identity verified status ──
 app.post("/verify-identity", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 10)) return;
 
   const email = sanitize(req.body.email);
   const selfie_url = req.body.selfie_url;
@@ -359,6 +378,19 @@ app.post("/verify-identity", async (req, res) => {
     return res.status(400).json({
       success: false,
       message: "Email is required."
+    });
+  }
+
+  const { data: existing } = await supabase
+    .from("workers")
+    .select("id")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (!existing) {
+    return res.status(404).json({
+      success: false,
+      message: "Worker profile not found for this email."
     });
   }
 
@@ -395,19 +427,38 @@ app.post("/verify-identity", async (req, res) => {
 
 // ── Initialize Paystack payment ──
 app.post("/payment/initialize", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 20)) return;
 
   const email = sanitize(req.body.email);
   const amount = parseFloat(req.body.amount);
   const shift_data = req.body.shift_data;
 
-  if (!email || !amount) {
+  if (!email || !amount || amount <= 0) {
     return res.status(400).json({
       success: false,
-      message: "Email and amount are required."
+      message: "Valid email and amount are required."
+    });
+  }
+
+  if (!shift_data) {
+    return res.status(400).json({
+      success: false,
+      message: "shift_data is required."
+    });
+  }
+
+  const { facilityTotal } = computeShiftAmounts(shift_data);
+  if (facilityTotal <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid shift pay details."
+    });
+  }
+
+  if (Math.abs(amount - facilityTotal) > 0.02) {
+    return res.status(400).json({
+      success: false,
+      message: "Payment amount does not match shift total."
     });
   }
 
@@ -459,10 +510,7 @@ app.post("/payment/initialize", async (req, res) => {
 
 // ── Verify Paystack payment ──
 app.post("/payment/verify", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 20)) return;
 
   const reference = sanitize(req.body.reference);
 
@@ -474,11 +522,26 @@ app.post("/payment/verify", async (req, res) => {
   }
 
   try {
+    const { data: existingShift } = await supabase
+      .from("shifts")
+      .select("id")
+      .eq("payment_reference", reference)
+      .maybeSingle();
+
+    if (existingShift) {
+      return res.json({
+        success: true,
+        message: "Payment already verified and shift created.",
+        reference,
+        already_processed: true
+      });
+    }
+
     const response = await fetch(
       `https://api.paystack.co/transaction/verify/${reference}`,
       {
         headers: {
-          "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
         }
       }
     );
@@ -493,30 +556,52 @@ app.post("/payment/verify", async (req, res) => {
       });
     }
 
-    // ── Save shift to database after payment ──
     const metadata = data.data.metadata;
-    const shift_data = metadata.shift_data ? JSON.parse(metadata.shift_data) : null;
+    const rawShiftData = metadata.shift_data ? JSON.parse(metadata.shift_data) : null;
 
-    if (shift_data) {
-      const { error } = await supabase
-        .from("shifts")
-        .insert([{
-          ...shift_data,
-          payment_reference: reference,
-          payment_status: "paid",
-          status: "open"
-        }]);
-
-      if (error) {
-        log("error", "Shift save error after payment", { error: error.message });
-      }
+    if (!rawShiftData) {
+      return res.status(400).json({
+        success: false,
+        message: "Shift data missing from payment."
+      });
     }
 
-    log("info", "Payment verified", { reference, amount: data.data.amount / 100 });
+    const shiftFields = pickShiftFields(rawShiftData);
+    const { workerTotal, facilityTotal } = computeShiftAmounts(shiftFields);
+    const paidAmount = data.data.amount / 100;
+
+    if (Math.abs(paidAmount - facilityTotal) > 0.02) {
+      log("error", "Payment amount mismatch", { reference, paidAmount, facilityTotal });
+      return res.status(400).json({
+        success: false,
+        message: "Paid amount does not match expected shift cost."
+      });
+    }
+
+    shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+
+    const { error } = await supabase
+      .from("shifts")
+      .insert([{
+        ...shiftFields,
+        payment_reference: reference,
+        payment_status: "paid",
+        status: "open"
+      }]);
+
+    if (error) {
+      log("error", "Shift save error after payment", { error: error.message, reference });
+      return res.status(500).json({
+        success: false,
+        message: "Payment received but shift could not be saved. Contact support with your reference."
+      });
+    }
+
+    log("info", "Payment verified", { reference, amount: paidAmount });
     return res.json({
       success: true,
       message: "Payment verified successfully.",
-      amount: data.data.amount / 100,
+      amount: paidAmount,
       reference
     });
 
@@ -524,8 +609,7 @@ app.post("/payment/verify", async (req, res) => {
     log("error", "Payment verify error", { error: err.message });
     return res.status(500).json({
       success: false,
-      message: "Verification service unavailable.",
-      error: err.message
+      message: "Verification service unavailable."
     });
   }
 });
@@ -664,10 +748,7 @@ async function initiateWorkerPayout(worker, shift) {
 
 // ── Accept shift & generate QR ──
 app.post("/shift/accept", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 30)) return;
 
   const shiftId = sanitize(req.body.shift_id);
   const workerId = sanitize(req.body.worker_id);
@@ -737,6 +818,27 @@ app.post("/shift/accept", async (req, res) => {
     });
   }
 
+  if (shift.payment_status && shift.payment_status !== "paid") {
+    return res.status(400).json({
+      success: false,
+      message: "This shift has not been paid for yet."
+    });
+  }
+
+  if (!worker.identity_verified) {
+    return res.status(400).json({
+      success: false,
+      message: "Complete identity verification before accepting shifts."
+    });
+  }
+
+  if (isPharmacyRole(shift.role_needed) && !worker.license_verified) {
+    return res.status(400).json({
+      success: false,
+      message: "License verification is required for pharmacy shifts."
+    });
+  }
+
   const qrToken = generateQrToken();
   const qrUrl = buildQrUrl(shiftId, workerId, qrToken);
 
@@ -754,10 +856,9 @@ app.post("/shift/accept", async (req, res) => {
 
   if (error || !data) {
     log("error", "Shift accept error", { error: error?.message });
-    return res.status(500).json({
+    return res.status(409).json({
       success: false,
-      message: "Failed to accept shift.",
-      error: error?.message
+      message: "This shift was just taken by another worker."
     });
   }
 
@@ -773,14 +874,12 @@ app.post("/shift/accept", async (req, res) => {
 
 // ── Confirm worker arrival ──
 app.post("/shift/arrive", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 30)) return;
 
   const shiftId = sanitize(req.body.shift_id);
   const workerId = sanitize(req.body.worker_id);
   const token = sanitize(req.body.token);
+  const facilityEmail = sanitize(req.body.facility_email);
 
   if (!shiftId || !workerId || !token) {
     return res.status(400).json({
@@ -798,6 +897,13 @@ app.post("/shift/arrive", async (req, res) => {
   }
 
   const { shift } = validation;
+
+  if (facilityEmail && shift.contact_email !== facilityEmail) {
+    return res.status(403).json({
+      success: false,
+      message: "This shift does not belong to your facility."
+    });
+  }
 
   if (shift.status === "in_progress") {
     return res.json({
@@ -856,10 +962,7 @@ app.post("/shift/arrive", async (req, res) => {
 
 // ── Complete shift & trigger payout ──
 app.post("/shift/complete", async (req, res) => {
-  const api_key = req.headers["x-api-key"];
-  if (api_key !== API_KEY) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
-  }
+  if (!requireApiKey(req, res) || !rateLimitRoute(req, res, 20)) return;
 
   const shiftId = sanitize(req.body.shift_id);
   const workerId = sanitize(req.body.worker_id);
@@ -897,6 +1000,17 @@ app.post("/shift/complete", async (req, res) => {
       success: false,
       message: `Cannot complete — shift status is "${shift.status}". Worker must check in first.`
     });
+  }
+
+  const MIN_SHIFT_MINUTES = 30;
+  if (shift.arrival_time) {
+    const elapsedMins = (Date.now() - new Date(shift.arrival_time).getTime()) / 60000;
+    if (elapsedMins < MIN_SHIFT_MINUTES) {
+      return res.status(400).json({
+        success: false,
+        message: `Shift must run at least ${MIN_SHIFT_MINUTES} minutes before checkout.`
+      });
+    }
   }
 
   const completionTime = new Date().toISOString();
@@ -956,10 +1070,10 @@ app.post("/shift/complete", async (req, res) => {
 
   log("info", "Shift completed", { shiftId, workerId, completionTime, payout });
   return res.json({
-    success: true,
+    success: !payoutError,
     message: payout
       ? "Shift completed. Payout sent to worker's Mobile Money."
-      : "Shift completed. Payout could not be processed — support will follow up.",
+      : "Shift completed but payout failed — support will follow up.",
     completion_time: completionTime,
     payout,
     payout_error: payoutError,
@@ -969,5 +1083,14 @@ app.post("/shift/complete", async (req, res) => {
 
 // ── Start server ──
 app.listen(PORT, () => {
+  if (!process.env.API_KEY) {
+    log("warn", "API_KEY not set — using development fallback");
+  }
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SECRET_KEY) {
+    log("warn", "Supabase env vars missing — database calls will fail");
+  }
+  if (!process.env.PAYSTACK_SECRET_KEY) {
+    log("warn", "PAYSTACK_SECRET_KEY not set — payments disabled");
+  }
   log("info", "Server started", { port: PORT });
 });
