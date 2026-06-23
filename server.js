@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const puppeteer = require("puppeteer");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -527,6 +528,407 @@ app.post("/payment/verify", async (req, res) => {
       error: err.message
     });
   }
+});
+
+// ── QR arrival helpers ──
+const ARRIVE_BASE_URL =
+  process.env.ARRIVE_URL || "https://covercare-africa.vercel.app/arrive";
+
+function generateQrToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function buildQrUrl(shiftId, workerId, token) {
+  const params = new URLSearchParams({
+    shift_id: shiftId,
+    worker_id: workerId,
+    token
+  });
+  return `${ARRIVE_BASE_URL}?${params.toString()}`;
+}
+
+function parsePayAmount(totalPay) {
+  if (!totalPay) return 0;
+  return parseFloat(totalPay.toString().replace(/[^0-9.]/g, "")) || 0;
+}
+
+async function getShiftById(shiftId) {
+  const { data, error } = await supabase
+    .from("shifts")
+    .select("*")
+    .eq("id", shiftId)
+    .single();
+
+  if (error || !data) return null;
+  return data;
+}
+
+async function validateQrCredentials(shiftId, workerId, token) {
+  const shift = await getShiftById(shiftId);
+
+  if (!shift) {
+    return { ok: false, status: 404, message: "Shift not found." };
+  }
+
+  if (shift.worker_id !== workerId) {
+    return { ok: false, status: 403, message: "Worker does not match this shift." };
+  }
+
+  if (!shift.qr_token || shift.qr_token !== token) {
+    return { ok: false, status: 403, message: "Invalid or expired QR token." };
+  }
+
+  return { ok: true, shift };
+}
+
+async function getOrCreatePaystackRecipient(worker) {
+  if (worker.paystack_recipient_code) {
+    return worker.paystack_recipient_code;
+  }
+
+  const phone = (worker.phone || "").replace(/\D/g, "");
+  if (!phone) {
+    throw new Error("Worker phone number is required for payout.");
+  }
+
+  const bankCode = phone.startsWith("02") || phone.startsWith("24") || phone.startsWith("54")
+    ? "VOD"
+    : "MTN";
+
+  const response = await fetch("https://api.paystack.co/transferrecipient", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      type: "mobile_money",
+      name: worker.full_name,
+      account_number: phone,
+      bank_code: bankCode,
+      currency: "GHS"
+    })
+  });
+
+  const data = await response.json();
+  if (!data.status) {
+    throw new Error(data.message || "Failed to create Paystack recipient.");
+  }
+
+  const recipientCode = data.data.recipient_code;
+
+  const { error: recipientUpdateError } = await supabase
+    .from("workers")
+    .update({ paystack_recipient_code: recipientCode })
+    .eq("id", worker.id);
+
+  if (recipientUpdateError) {
+    log("warn", "Could not save recipient code", { error: recipientUpdateError.message });
+  }
+
+  return recipientCode;
+}
+
+async function initiateWorkerPayout(worker, shift) {
+  const amountGhs = parsePayAmount(shift.total_pay);
+  if (amountGhs <= 0) {
+    throw new Error("Invalid shift payout amount.");
+  }
+
+  const recipientCode = await getOrCreatePaystackRecipient(worker);
+
+  const response = await fetch("https://api.paystack.co/transfer", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      source: "balance",
+      amount: Math.round(amountGhs * 100),
+      recipient: recipientCode,
+      reason: `CoverCare shift payout — ${shift.facility_name}`
+    })
+  });
+
+  const data = await response.json();
+  if (!data.status) {
+    throw new Error(data.message || "Paystack transfer failed.");
+  }
+
+  return {
+    transfer_code: data.data.transfer_code,
+    amount: amountGhs
+  };
+}
+
+// ── Accept shift & generate QR ──
+app.post("/shift/accept", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const shiftId = sanitize(req.body.shift_id);
+  const workerId = sanitize(req.body.worker_id);
+
+  if (!shiftId || !workerId) {
+    return res.status(400).json({
+      success: false,
+      message: "shift_id and worker_id are required."
+    });
+  }
+
+  const { data: worker, error: workerError } = await supabase
+    .from("workers")
+    .select("id, full_name, email, phone, role, license_verified, identity_verified")
+    .eq("id", workerId)
+    .single();
+
+  if (workerError || !worker) {
+    return res.status(404).json({ success: false, message: "Worker not found." });
+  }
+
+  const shift = await getShiftById(shiftId);
+  if (!shift) {
+    return res.status(404).json({ success: false, message: "Shift not found." });
+  }
+
+  if (shift.status !== "open") {
+    return res.status(400).json({
+      success: false,
+      message: "This shift is no longer available."
+    });
+  }
+
+  const qrToken = generateQrToken();
+  const qrUrl = buildQrUrl(shiftId, workerId, qrToken);
+
+  const { data, error } = await supabase
+    .from("shifts")
+    .update({
+      worker_id: workerId,
+      qr_token: qrToken,
+      status: "accepted"
+    })
+    .eq("id", shiftId)
+    .eq("status", "open")
+    .select()
+    .single();
+
+  if (error || !data) {
+    log("error", "Shift accept error", { error: error?.message });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to accept shift.",
+      error: error?.message
+    });
+  }
+
+  log("info", "Shift accepted", { shiftId, workerId });
+  return res.json({
+    success: true,
+    message: "Shift accepted. Show your QR code on arrival.",
+    qr_url: qrUrl,
+    qr_token: qrToken,
+    shift: data
+  });
+});
+
+// ── Confirm worker arrival ──
+app.post("/shift/arrive", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const shiftId = sanitize(req.body.shift_id);
+  const workerId = sanitize(req.body.worker_id);
+  const token = sanitize(req.body.token);
+
+  if (!shiftId || !workerId || !token) {
+    return res.status(400).json({
+      success: false,
+      message: "shift_id, worker_id, and token are required."
+    });
+  }
+
+  const validation = await validateQrCredentials(shiftId, workerId, token);
+  if (!validation.ok) {
+    return res.status(validation.status).json({
+      success: false,
+      message: validation.message
+    });
+  }
+
+  const { shift } = validation;
+
+  if (shift.status === "in_progress") {
+    return res.json({
+      success: true,
+      message: "Worker already checked in.",
+      already_arrived: true,
+      arrival_time: shift.arrival_time,
+      shift
+    });
+  }
+
+  if (shift.status !== "accepted") {
+    return res.status(400).json({
+      success: false,
+      message: `Cannot check in — shift status is "${shift.status}".`
+    });
+  }
+
+  const arrivalTime = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("shifts")
+    .update({
+      arrival_time: arrivalTime,
+      status: "in_progress"
+    })
+    .eq("id", shiftId)
+    .eq("status", "accepted")
+    .select()
+    .single();
+
+  if (error || !data) {
+    log("error", "Shift arrive error", { error: error?.message });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to log arrival.",
+      error: error?.message
+    });
+  }
+
+  const { data: worker } = await supabase
+    .from("workers")
+    .select("id, full_name, role, license_verified, identity_verified")
+    .eq("id", workerId)
+    .single();
+
+  log("info", "Worker arrived", { shiftId, workerId, arrivalTime });
+  return res.json({
+    success: true,
+    message: "Arrival confirmed. Shift is now in progress.",
+    arrival_time: arrivalTime,
+    worker,
+    shift: data
+  });
+});
+
+// ── Complete shift & trigger payout ──
+app.post("/shift/complete", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const shiftId = sanitize(req.body.shift_id);
+  const workerId = sanitize(req.body.worker_id);
+  const token = sanitize(req.body.token);
+
+  if (!shiftId || !workerId || !token) {
+    return res.status(400).json({
+      success: false,
+      message: "shift_id, worker_id, and token are required."
+    });
+  }
+
+  const validation = await validateQrCredentials(shiftId, workerId, token);
+  if (!validation.ok) {
+    return res.status(validation.status).json({
+      success: false,
+      message: validation.message
+    });
+  }
+
+  const { shift } = validation;
+
+  if (shift.status === "completed") {
+    return res.json({
+      success: true,
+      message: "Shift already completed.",
+      already_completed: true,
+      completion_time: shift.completion_time,
+      shift
+    });
+  }
+
+  if (shift.status !== "in_progress") {
+    return res.status(400).json({
+      success: false,
+      message: `Cannot complete — shift status is "${shift.status}". Worker must check in first.`
+    });
+  }
+
+  const completionTime = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("shifts")
+    .update({
+      completion_time: completionTime,
+      status: "completed"
+    })
+    .eq("id", shiftId)
+    .eq("status", "in_progress")
+    .select()
+    .single();
+
+  if (error || !data) {
+    log("error", "Shift complete error", { error: error?.message });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to complete shift.",
+      error: error?.message
+    });
+  }
+
+  const { data: worker, error: workerError } = await supabase
+    .from("workers")
+    .select("id, full_name, email, phone, paystack_recipient_code")
+    .eq("id", workerId)
+    .single();
+
+  let payout = null;
+  let payoutError = null;
+
+  if (workerError || !worker) {
+    payoutError = "Worker record not found for payout.";
+  } else {
+    try {
+      payout = await initiateWorkerPayout(worker, data);
+      await supabase
+        .from("shifts")
+        .update({
+          payout_status: "paid",
+          payout_reference: payout.transfer_code
+        })
+        .eq("id", shiftId);
+    } catch (err) {
+      payoutError = err.message;
+      log("error", "Payout failed", { shiftId, error: err.message });
+      try {
+        await supabase
+          .from("shifts")
+          .update({ payout_status: "failed" })
+          .eq("id", shiftId);
+      } catch (_) {}
+    }
+  }
+
+  log("info", "Shift completed", { shiftId, workerId, completionTime, payout });
+  return res.json({
+    success: true,
+    message: payout
+      ? "Shift completed. Payout sent to worker's Mobile Money."
+      : "Shift completed. Payout could not be processed — support will follow up.",
+    completion_time: completionTime,
+    payout,
+    payout_error: payoutError,
+    shift: data
+  });
 });
 
 // ── Start server ──
