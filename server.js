@@ -1081,6 +1081,556 @@ app.post("/shift/complete", async (req, res) => {
   });
 });
 
+// ── Apply to shift ──
+app.post("/applications/apply", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { worker_id, shift_id, cover_note } = req.body;
+
+  if (!worker_id || !shift_id) {
+    return res.status(400).json({
+      success: false,
+      message: "worker_id and shift_id are required."
+    });
+  }
+
+  // Check shift is still open
+  const { data: shift, error: shiftError } = await supabase
+    .from("shifts")
+    .select("id, status, role_needed, facility_name")
+    .eq("id", shift_id)
+    .single();
+
+  if (shiftError || !shift) {
+    return res.status(404).json({
+      success: false,
+      message: "Shift not found."
+    });
+  }
+
+  if (shift.status !== "open") {
+    return res.status(400).json({
+      success: false,
+      message: "This shift is no longer accepting applications."
+    });
+  }
+
+  // Check not already applied
+  const { data: existing } = await supabase
+    .from("applications")
+    .select("id, status")
+    .eq("worker_id", worker_id)
+    .eq("shift_id", shift_id)
+    .single();
+
+  if (existing) {
+    return res.status(400).json({
+      success: false,
+      message: "You have already applied to this shift.",
+      existing_status: existing.status
+    });
+  }
+
+  // Create application
+  const { data, error } = await supabase
+    .from("applications")
+    .insert([{
+      worker_id,
+      shift_id,
+      cover_note: sanitize(cover_note || ""),
+      status: "pending"
+    }])
+    .select()
+    .single();
+
+  if (error) {
+    log("error", "Application creation error", { error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to submit application.",
+      error: error.message
+    });
+  }
+
+  log("info", "Application submitted", { worker_id, shift_id });
+  return res.json({
+    success: true,
+    message: "Application submitted successfully.",
+    data
+  });
+});
+
+// ── Withdraw application ──
+app.post("/applications/withdraw", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { application_id, worker_id } = req.body;
+
+  if (!application_id || !worker_id) {
+    return res.status(400).json({
+      success: false,
+      message: "application_id and worker_id are required."
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("applications")
+    .update({
+      status: "withdrawn",
+      responded_at: new Date().toISOString()
+    })
+    .eq("id", application_id)
+    .eq("worker_id", worker_id)
+    .eq("status", "pending")
+    .select()
+    .single();
+
+  if (error || !data) {
+    return res.status(400).json({
+      success: false,
+      message: "Could not withdraw application. It may already be processed."
+    });
+  }
+
+  log("info", "Application withdrawn", { application_id, worker_id });
+  return res.json({
+    success: true,
+    message: "Application withdrawn successfully.",
+    data
+  });
+});
+
+// ── Accept application ──
+app.post("/applications/accept", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { application_id, facility_email } = req.body;
+
+  if (!application_id || !facility_email) {
+    return res.status(400).json({
+      success: false,
+      message: "application_id and facility_email are required."
+    });
+  }
+
+  // Get application details
+  const { data: application, error: appError } = await supabase
+    .from("applications")
+    .select("*, shifts(*), workers(*)")
+    .eq("id", application_id)
+    .single();
+
+  if (appError || !application) {
+    return res.status(404).json({
+      success: false,
+      message: "Application not found."
+    });
+  }
+
+  // Accept this application
+  const { data, error } = await supabase
+    .from("applications")
+    .update({
+      status: "accepted",
+      responded_at: new Date().toISOString(),
+      responded_by: facility_email
+    })
+    .eq("id", application_id)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to accept application.",
+      error: error.message
+    });
+  }
+
+  // Reject all other pending applications for this shift
+  await supabase
+    .from("applications")
+    .update({
+      status: "rejected",
+      responded_at: new Date().toISOString(),
+      responded_by: "system"
+    })
+    .eq("shift_id", application.shift_id)
+    .eq("status", "pending")
+    .neq("id", application_id);
+
+  // Update shift status and assign worker
+  await supabase
+    .from("shifts")
+    .update({
+      status: "accepted",
+      worker_id: application.worker_id
+    })
+    .eq("id", application.shift_id);
+
+  log("info", "Application accepted", { application_id, facility_email });
+  return res.json({
+    success: true,
+    message: "Application accepted. Worker assigned to shift.",
+    data
+  });
+});
+
+// ── Reject application ──
+app.post("/applications/reject", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { application_id, facility_email } = req.body;
+
+  if (!application_id || !facility_email) {
+    return res.status(400).json({
+      success: false,
+      message: "application_id and facility_email are required."
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("applications")
+    .update({
+      status: "rejected",
+      responded_at: new Date().toISOString(),
+      responded_by: facility_email
+    })
+    .eq("id", application_id)
+    .eq("status", "pending")
+    .select()
+    .single();
+
+  if (error || !data) {
+    return res.status(400).json({
+      success: false,
+      message: "Could not reject application."
+    });
+  }
+
+  log("info", "Application rejected", { application_id });
+  return res.json({
+    success: true,
+    message: "Application rejected.",
+    data
+  });
+});
+
+// ── Get applications for a shift (facility view) ──
+app.get("/applications/shift/:shift_id", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { shift_id } = req.params;
+
+  const { data, error } = await supabase
+    .from("applications")
+    .select(`
+      *,
+      workers (
+        id, full_name, email, role, city, experience,
+        license_verified, identity_verified
+      )
+    `)
+    .eq("shift_id", shift_id)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load applications.",
+      error: error.message
+    });
+  }
+
+  return res.json({
+    success: true,
+    data: data || []
+  });
+});
+
+// ── Get applications for a worker (worker view) ──
+app.get("/applications/worker/:worker_id", async (req, res) => {
+  const api_key = req.headers["x-api-key"];
+  if (api_key !== API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { worker_id } = req.params;
+
+  const { data, error } = await supabase
+    .from("applications")
+    .select(`
+      *,
+      shifts (
+        id, facility_name, role_needed, city,
+        shift_date, start_time, duration, pay_rate, status
+      )
+    `)
+    .eq("worker_id", worker_id)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load applications.",
+      error: error.message
+    });
+  }
+
+  return res.json({
+    success: true,
+    data: data || []
+  });
+});
+
+// ── Apply to shift ──
+app.post("/applications/apply", async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const { worker_id, shift_id, cover_note } = req.body;
+
+  if (!worker_id || !shift_id) {
+    return res.status(400).json({
+      success: false,
+      message: "worker_id and shift_id are required."
+    });
+  }
+
+  // Check shift is still open
+  const { data: shift } = await supabase
+    .from("shifts")
+    .select("id, status")
+    .eq("id", shift_id)
+    .single();
+
+  if (!shift || shift.status !== "open") {
+    return res.status(400).json({
+      success: false,
+      message: "This shift is no longer accepting applications."
+    });
+  }
+
+  // Check not already applied
+  const { data: existing } = await supabase
+    .from("applications")
+    .select("id, status")
+    .eq("worker_id", worker_id)
+    .eq("shift_id", shift_id)
+    .single();
+
+  if (existing) {
+    return res.status(400).json({
+      success: false,
+      message: "You have already applied to this shift.",
+      existing_status: existing.status
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("applications")
+    .insert([{
+      worker_id,
+      shift_id,
+      cover_note: sanitize(cover_note || ""),
+      status: "pending"
+    }])
+    .select()
+    .single();
+
+  if (error) {
+    log("error", "Application error", { error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to submit application.",
+      error: error.message
+    });
+  }
+
+  log("info", "Application submitted", { worker_id, shift_id });
+  return res.json({ success: true, message: "Application submitted.", data });
+});
+
+// ── Withdraw application ──
+app.post("/applications/withdraw", async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const { application_id, worker_id } = req.body;
+
+  if (!application_id || !worker_id) {
+    return res.status(400).json({
+      success: false,
+      message: "application_id and worker_id are required."
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("applications")
+    .update({ status: "withdrawn", responded_at: new Date().toISOString() })
+    .eq("id", application_id)
+    .eq("worker_id", worker_id)
+    .eq("status", "pending")
+    .select()
+    .single();
+
+  if (error || !data) {
+    return res.status(400).json({
+      success: false,
+      message: "Could not withdraw. Application may already be processed."
+    });
+  }
+
+  return res.json({ success: true, message: "Application withdrawn.", data });
+});
+
+// ── Accept application ──
+app.post("/applications/accept", async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const { application_id, facility_email } = req.body;
+
+  if (!application_id || !facility_email) {
+    return res.status(400).json({
+      success: false,
+      message: "application_id and facility_email are required."
+    });
+  }
+
+  const { data: application } = await supabase
+    .from("applications")
+    .select("*, shifts(*), workers(*)")
+    .eq("id", application_id)
+    .single();
+
+  if (!application) {
+    return res.status(404).json({ success: false, message: "Application not found." });
+  }
+
+  // Accept this application
+  const { data, error } = await supabase
+    .from("applications")
+    .update({
+      status: "accepted",
+      responded_at: new Date().toISOString(),
+      responded_by: facility_email
+    })
+    .eq("id", application_id)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to accept application.",
+      error: error.message
+    });
+  }
+
+  // Reject all other pending applications for this shift
+  await supabase
+    .from("applications")
+    .update({
+      status: "rejected",
+      responded_at: new Date().toISOString(),
+      responded_by: "system"
+    })
+    .eq("shift_id", application.shift_id)
+    .eq("status", "pending")
+    .neq("id", application_id);
+
+  // Assign worker to shift
+  await supabase
+    .from("shifts")
+    .update({ status: "accepted", worker_id: application.worker_id })
+    .eq("id", application.shift_id);
+
+  log("info", "Application accepted", { application_id });
+  return res.json({ success: true, message: "Application accepted. Worker assigned.", data });
+});
+
+// ── Reject application ──
+app.post("/applications/reject", async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const { application_id, facility_email } = req.body;
+
+  if (!application_id) {
+    return res.status(400).json({
+      success: false,
+      message: "application_id is required."
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("applications")
+    .update({
+      status: "rejected",
+      responded_at: new Date().toISOString(),
+      responded_by: facility_email || "facility"
+    })
+    .eq("id", application_id)
+    .eq("status", "pending")
+    .select()
+    .single();
+
+  if (error || !data) {
+    return res.status(400).json({
+      success: false,
+      message: "Could not reject application."
+    });
+  }
+
+  return res.json({ success: true, message: "Application rejected.", data });
+});
+
+// ── Get applications for a shift ──
+app.get("/applications/shift/:shift_id", async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const { data, error } = await supabase
+    .from("applications")
+    .select(`*, workers(id, full_name, email, role, city, experience, license_verified, identity_verified)`)
+    .eq("shift_id", req.params.shift_id)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return res.status(500).json({ success: false, message: "Failed to load applications." });
+  }
+
+  return res.json({ success: true, data: data || [] });
+});
+
+// ── Get applications for a worker ──
+app.get("/applications/worker/:worker_id", async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const { data, error } = await supabase
+    .from("applications")
+    .select(`*, shifts(id, facility_name, role_needed, city, shift_date, start_time, duration, pay_rate, status)`)
+    .eq("worker_id", req.params.worker_id)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return res.status(500).json({ success: false, message: "Failed to load applications." });
+  }
+
+  return res.json({ success: true, data: data || [] });
+});
+
 // ── Start server ──
 app.listen(PORT, () => {
   if (!process.env.API_KEY) {
