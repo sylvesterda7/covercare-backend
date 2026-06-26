@@ -1280,6 +1280,712 @@ app.get("/shifts/history", async (req, res) => {
   return res.json({ success: true, role: "unknown", data: [] });
 });
 
+function getExperienceBand(exp) {
+  const s = (exp || "").toString().toLowerCase();
+  if (s.includes("entry") || s.includes("0") || s.includes("fresh") || s.includes("trainee")) return 1;
+  if (s.includes("1") || s.includes("junior") || s.includes("2")) return 2;
+  if (s.includes("3") || s.includes("mid") || s.includes("4") || s.includes("5")) return 3;
+  if (s.includes("5+") || s.includes("senior") || s.includes("lead") || s.includes("principal") || s.includes("6") || s.includes("7") || s.includes("8") || s.includes("9") || s.includes("10")) return 4;
+  return 2;
+}
+
+function calculateMatchScore(worker, shift) {
+  const breakdown = { role: 0, city: 0, experience: 0, license: 0, identity: 0 };
+
+  if ((worker.role || "").toLowerCase() !== (shift.role_needed || "").toLowerCase()) {
+    return { score: 0, breakdown, maxScore: 100 };
+  }
+  breakdown.role = 40;
+
+  if ((worker.city || "").toLowerCase() !== (shift.city || "").toLowerCase()) {
+    return { score: 0, breakdown, maxScore: 100 };
+  }
+  breakdown.city = 30;
+
+  const wBand = getExperienceBand(worker.experience);
+  const sBand = getExperienceBand(shift.experience_required);
+  const diff = Math.abs(wBand - sBand);
+  if (diff <= 1) breakdown.experience = 15;
+  else if (diff <= 2) breakdown.experience = 10;
+  else breakdown.experience = 5;
+
+  breakdown.license = worker.license_verified ? 10 : 0;
+  breakdown.identity = worker.identity_verified ? 5 : 0;
+
+  const score = breakdown.role + breakdown.city + breakdown.experience + breakdown.license + breakdown.identity;
+  return { score, breakdown, maxScore: 100 };
+}
+
+app.get("/matches/worker", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("*")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    const { data: openShifts } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("status", "open")
+      .eq("payment_status", "paid");
+
+    if (!openShifts || openShifts.length === 0) {
+      return res.json({ success: true, matches: [] });
+    }
+
+    const { data: applications } = await supabase
+      .from("applications")
+      .select("shift_id")
+      .eq("worker_id", worker.id);
+
+    const appliedShiftIds = new Set((applications || []).map(a => a.shift_id));
+
+    const matches = openShifts
+      .filter(s => !appliedShiftIds.has(s.id))
+      .map(shift => {
+        const { score, breakdown } = calculateMatchScore(worker, shift);
+        return { shift, score, breakdown };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    return res.json({ success: true, matches });
+  } catch (err) {
+    log("error", "Matches worker error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to compute matches." });
+  }
+});
+
+app.get("/matches/facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: facility } = await supabase
+      .from("facilities")
+      .select("*")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!facility) {
+      return res.status(404).json({ success: false, message: "Facility profile not found." });
+    }
+
+    const { data: facilityShifts } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("contact_email", user.email)
+      .eq("status", "open");
+
+    if (!facilityShifts || facilityShifts.length === 0) {
+      return res.json({ success: true, matches: {} });
+    }
+
+    const { data: allWorkers } = await supabase
+      .from("workers")
+      .select("*");
+
+    const matches = {};
+    for (const shift of facilityShifts) {
+      const { data: applications } = await supabase
+        .from("applications")
+        .select("worker_id")
+        .eq("shift_id", shift.id);
+
+      const appliedWorkerIds = new Set((applications || []).map(a => a.worker_id));
+
+      const matchedWorkers = (allWorkers || [])
+        .filter(w => {
+          if (appliedWorkerIds.has(w.id)) return false;
+          if ((w.role || "").toLowerCase() !== (shift.role_needed || "").toLowerCase()) return false;
+          if ((w.city || "").toLowerCase() !== (shift.city || "").toLowerCase()) return false;
+          return true;
+        })
+        .map(worker => {
+          const { score, breakdown } = calculateMatchScore(worker, shift);
+          return { worker, score, breakdown };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      matches[shift.id] = matchedWorkers;
+    }
+
+    return res.json({ success: true, matches });
+  } catch (err) {
+    log("error", "Matches facility error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to compute matches." });
+  }
+});
+
+app.get("/payroll/summary", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("*")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (worker) {
+      const { data: completed } = await supabase
+        .from("shifts")
+        .select("total_pay, completion_time")
+        .eq("worker_id", worker.id)
+        .eq("status", "completed")
+        .order("completion_time", { ascending: false });
+
+      const shifts = completed || [];
+      const totalEarnings = shifts.reduce((sum, s) => sum + parsePayAmount(s.total_pay), 0);
+      const shiftCount = shifts.length;
+      const lastPayout = shifts.length > 0 ? shifts[0].completion_time : null;
+
+      return res.json({
+        success: true,
+        role: "worker",
+        summary: { totalEarnings, shiftCount, lastPayout }
+      });
+    }
+
+    const { data: facility } = await supabase
+      .from("facilities")
+      .select("*")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (facility) {
+      const { data: completed } = await supabase
+        .from("shifts")
+        .select("total_pay, completion_time")
+        .eq("contact_email", user.email)
+        .eq("status", "completed")
+        .order("completion_time", { ascending: false });
+
+      const shifts = completed || [];
+      const totalSpend = shifts.reduce((sum, s) => sum + parsePayAmount(s.total_pay) * 1.25, 0);
+      const shiftCount = shifts.length;
+      const lastPayout = shifts.length > 0 ? shifts[0].completion_time : null;
+
+      return res.json({
+        success: true,
+        role: "facility",
+        summary: { totalSpend, shiftCount, lastPayout }
+      });
+    }
+
+    return res.status(404).json({ success: false, message: "User profile not found." });
+  } catch (err) {
+    log("error", "Payroll summary error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load payroll summary." });
+  }
+});
+
+app.get("/payroll/earnings", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("*")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    const { data, error } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("worker_id", worker.id)
+      .eq("status", "completed")
+      .order("completion_time", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load earnings." });
+    }
+
+    const result = (data || []).map(s => ({
+      shift: s,
+      payout_status: s.payout_status || null,
+      payout_reference: s.payout_reference || null
+    }));
+
+    return res.json({ success: true, data: result });
+  } catch (err) {
+    log("error", "Payroll earnings error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load earnings." });
+  }
+});
+
+app.get("/payroll/transactions", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: facility } = await supabase
+      .from("facilities")
+      .select("*")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!facility) {
+      return res.status(404).json({ success: false, message: "Facility profile not found." });
+    }
+
+    const { data, error } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("contact_email", user.email)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load transactions." });
+    }
+
+    const result = (data || []).map(s => ({
+      shift: s,
+      payment_reference: s.payment_reference || null,
+      payment_status: s.payment_status || null
+    }));
+
+    return res.json({ success: true, data: result });
+  } catch (err) {
+    log("error", "Payroll transactions error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load transactions." });
+  }
+});
+
+app.get("/payroll/payslip/:shift_id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const shiftId = sanitize(req.params.shift_id);
+    const shift = await getShiftById(shiftId);
+
+    if (!shift) {
+      return res.status(404).json({ success: false, message: "Shift not found." });
+    }
+
+    if (shift.status !== "completed") {
+      return res.status(400).json({ success: false, message: "Shift is not yet completed." });
+    }
+
+    let isWorker = false;
+    if (shift.worker_id) {
+      const { data: w } = await supabase.from("workers").select("email").eq("id", shift.worker_id).single();
+      isWorker = !!(w && w.email.toLowerCase() === user.email.toLowerCase());
+    }
+
+    const isFacility = shift.contact_email && shift.contact_email.toLowerCase() === user.email.toLowerCase();
+
+    if (!isWorker && !isFacility) {
+      return res.status(403).json({ success: false, message: "You are not part of this shift." });
+    }
+
+    let workerName = "";
+    if (shift.worker_id) {
+      const { data: w } = await supabase.from("workers").select("full_name").eq("id", shift.worker_id).single();
+      if (w) workerName = w.full_name;
+    }
+
+    const facilityName = shift.facility_name || "";
+    const shiftDate = shift.shift_date || null;
+
+    let hoursWorked = 0;
+    if (shift.arrival_time && shift.completion_time) {
+      hoursWorked = Math.round((new Date(shift.completion_time) - new Date(shift.arrival_time)) / 3600000 * 100) / 100;
+    }
+
+    const { hours, rate, workerTotal, facilityTotal } = computeShiftAmounts(shift);
+    const grossPay = workerTotal;
+    const platformFee = Math.round(workerTotal * 0.25 * 100) / 100;
+    const netPay = Math.round((grossPay - platformFee) * 100) / 100;
+
+    return res.json({
+      success: true,
+      payslip: {
+        shift,
+        workerName,
+        facilityName,
+        date: shiftDate,
+        hoursWorked: hoursWorked || hours,
+        hourlyRate: rate,
+        grossPay,
+        platformFee,
+        netPay
+      }
+    });
+  } catch (err) {
+    log("error", "Payslip error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to generate payslip." });
+  }
+});
+
+app.post("/ratings", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { shift_id, rating, review, target_email } = req.body;
+
+    if (!shift_id || !rating || !target_email) {
+      return res.status(400).json({ success: false, message: "shift_id, rating, and target_email are required." });
+    }
+
+    const ratingNum = parseInt(rating, 10);
+    if (ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({ success: false, message: "Rating must be between 1 and 5." });
+    }
+
+    const shift = await getShiftById(shift_id);
+    if (!shift) {
+      return res.status(404).json({ success: false, message: "Shift not found." });
+    }
+
+    if (shift.status !== "completed") {
+      return res.status(400).json({ success: false, message: "Can only rate completed shifts." });
+    }
+
+    const { data: callerWorker } = await supabase
+      .from("workers")
+      .select("id, email")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    const { data: callerFacility } = await supabase
+      .from("facilities")
+      .select("id, email")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    const callerEmail = user.email.toLowerCase();
+    const shiftWorkerEmail = shift.worker_id
+      ? (await supabase.from("workers").select("email").eq("id", shift.worker_id).single()).data?.email
+      : null;
+
+    const isPartOfShift =
+      (callerWorker && shift.worker_id === callerWorker.id) ||
+      (shift.contact_email && shift.contact_email.toLowerCase() === callerEmail);
+
+    if (!isPartOfShift) {
+      return res.status(403).json({ success: false, message: "You are not part of this shift." });
+    }
+
+    const raterEmail = user.email;
+
+    const { data: existing } = await supabase
+      .from("ratings")
+      .select("id")
+      .eq("shift_id", shift_id)
+      .eq("rater_email", raterEmail)
+      .maybeSingle();
+
+    if (existing) {
+      const { data, error } = await supabase
+        .from("ratings")
+        .update({ rating: ratingNum, review: sanitize(review || ""), updated_at: new Date().toISOString() })
+        .eq("id", existing.id)
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(500).json({ success: false, message: "Failed to update rating." });
+      }
+
+      log("info", "Rating updated", { shift_id, rater: raterEmail, target: target_email });
+      return res.json({ success: true, data });
+    }
+
+    const { data, error } = await supabase
+      .from("ratings")
+      .insert([{
+        shift_id,
+        rater_email: raterEmail,
+        target_email: target_email.toLowerCase(),
+        rating: ratingNum,
+        review: sanitize(review || ""),
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to submit rating." });
+    }
+
+    log("info", "Rating created", { shift_id, rater: raterEmail, target: target_email });
+    return res.json({ success: true, data });
+  } catch (err) {
+    log("error", "Rating error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to submit rating." });
+  }
+});
+
+app.get("/ratings/mine", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const email = user.email.toLowerCase();
+
+    const { data: ratings, error } = await supabase
+      .from("ratings")
+      .select("*")
+      .eq("target_email", email)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load ratings." });
+    }
+
+    const enriched = await Promise.all((ratings || []).map(async (r) => {
+      let raterName = null;
+      const { data: worker } = await supabase
+        .from("workers")
+        .select("full_name")
+        .eq("email", r.rater_email)
+        .maybeSingle();
+      if (worker) {
+        raterName = worker.full_name;
+      } else {
+        const { data: facility } = await supabase
+          .from("facilities")
+          .select("facility_name")
+          .eq("email", r.rater_email)
+          .maybeSingle();
+        if (facility) raterName = facility.facility_name;
+      }
+      return { ...r, rater_name: raterName };
+    }));
+
+    return res.json({ success: true, data: enriched });
+  } catch (err) {
+    log("error", "Ratings mine error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load ratings." });
+  }
+});
+
+app.get("/ratings/given", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const email = user.email.toLowerCase();
+
+    const { data, error } = await supabase
+      .from("ratings")
+      .select("*")
+      .eq("rater_email", email)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load ratings." });
+    }
+
+    return res.json({ success: true, data: data || [] });
+  } catch (err) {
+    log("error", "Ratings given error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load ratings." });
+  }
+});
+
+app.post("/notifications", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { title, message, type, related_link } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ success: false, message: "title and message are required." });
+    }
+
+    const validTypes = ["info", "success", "warning", "error"];
+    const notifType = validTypes.includes(type) ? type : "info";
+
+    const { data, error } = await supabase
+      .from("notifications")
+      .insert([{
+        email: user.email.toLowerCase(),
+        title: sanitize(title),
+        message: sanitize(message),
+        type: notifType,
+        related_link: related_link ? sanitize(related_link) : null,
+        read: false,
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to create notification." });
+    }
+
+    log("info", "Notification created", { email: user.email, title });
+    return res.json({ success: true, data });
+  } catch (err) {
+    log("error", "Notification create error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to create notification." });
+  }
+});
+
+app.get("/notifications", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const email = user.email.toLowerCase();
+
+    const { data, error } = await supabase
+      .from("notifications")
+      .select("*")
+      .eq("email", email)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load notifications." });
+    }
+
+    const unread_count = (data || []).filter(n => !n.read).length;
+
+    return res.json({ success: true, data: data || [], unread_count });
+  } catch (err) {
+    log("error", "Notifications fetch error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load notifications." });
+  }
+});
+
+app.put("/notifications/:id/read", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const notifId = sanitize(req.params.id);
+    const email = user.email.toLowerCase();
+
+    const { data: existing } = await supabase
+      .from("notifications")
+      .select("id")
+      .eq("id", notifId)
+      .eq("email", email)
+      .maybeSingle();
+
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Notification not found." });
+    }
+
+    const { error } = await supabase
+      .from("notifications")
+      .update({ read: true })
+      .eq("id", notifId);
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to mark as read." });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    log("error", "Notification read error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to mark as read." });
+  }
+});
+
+app.post("/notifications/read-all", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const email = user.email.toLowerCase();
+
+    const { error } = await supabase
+      .from("notifications")
+      .update({ read: true })
+      .eq("email", email)
+      .eq("read", false);
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to mark all as read." });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    log("error", "Notifications read-all error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to mark all as read." });
+  }
+});
+
+app.post("/worker/availability", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { available } = req.body;
+
+    if (typeof available !== "boolean") {
+      return res.status(400).json({ success: false, message: "available must be a boolean." });
+    }
+
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("id")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    const { error } = await supabase
+      .from("workers")
+      .update({ available_for_work: available })
+      .eq("id", worker.id);
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to update availability." });
+    }
+
+    log("info", "Worker availability updated", { email: user.email, available });
+    return res.json({ success: true, available });
+  } catch (err) {
+    log("error", "Worker availability error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to update availability." });
+  }
+});
+
+app.get("/worker/availability", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("available_for_work")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    return res.json({ success: true, available: worker.available_for_work || false });
+  } catch (err) {
+    log("error", "Worker availability get error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to get availability." });
+  }
+});
+
 process.on("SIGTERM", async () => {
   await browserPool.close();
   process.exit(0);
