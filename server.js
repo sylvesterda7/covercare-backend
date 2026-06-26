@@ -1139,6 +1139,147 @@ app.post("/api/upload", async (req, res) => {
   }
 });
 
+app.put("/worker", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const { full_name, phone, role, license_number, city, experience } = req.body;
+
+  const { data: existing } = await supabase
+    .from("workers")
+    .select("id")
+    .eq("email", user.email)
+    .maybeSingle();
+
+  if (!existing) {
+    return res.status(404).json({ success: false, message: "Worker profile not found." });
+  }
+
+  const updates = {};
+  if (full_name) updates.full_name = sanitize(full_name);
+  if (phone) updates.phone = sanitize(phone);
+  if (role) updates.role = sanitize(role);
+  if (license_number) updates.license_number = sanitize(license_number);
+  if (city) updates.city = sanitize(city);
+  if (experience) updates.experience = sanitize(experience);
+
+  const { error } = await supabase.from("workers").update(updates).eq("id", existing.id);
+
+  if (error) {
+    log("error", "Worker update error", { error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to update profile." });
+  }
+
+  log("info", "Worker updated", { email: user.email });
+  return res.json({ success: true, message: "Profile updated successfully." });
+});
+
+app.put("/facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const { facility_name, facility_type, city, contact_name, contact_role, phone, staff_needs, frequency } = req.body;
+
+  const { data: existing } = await supabase
+    .from("facilities")
+    .select("id")
+    .eq("email", user.email)
+    .maybeSingle();
+
+  if (!existing) {
+    return res.status(404).json({ success: false, message: "Facility profile not found." });
+  }
+
+  const updates = {};
+  if (facility_name) updates.facility_name = sanitize(facility_name);
+  if (facility_type) updates.facility_type = sanitize(facility_type);
+  if (city) updates.city = sanitize(city);
+  if (contact_name) updates.contact_name = sanitize(contact_name);
+  if (contact_role) updates.contact_role = sanitize(contact_role);
+  if (phone) updates.phone = sanitize(phone);
+  if (staff_needs) updates.staff_needs = sanitize(staff_needs);
+  if (frequency) updates.frequency = sanitize(frequency);
+
+  const { error } = await supabase.from("facilities").update(updates).eq("id", existing.id);
+
+  if (error) {
+    log("error", "Facility update error", { error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to update profile." });
+  }
+
+  log("info", "Facility updated", { email: user.email });
+  return res.json({ success: true, message: "Profile updated successfully." });
+});
+
+app.post("/account/delete", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const email = req.body.email;
+  if (!email || email.toLowerCase() !== user.email.toLowerCase()) {
+    return res.status(400).json({ success: false, message: "Email must match your account." });
+  }
+
+  const { error: workerDel } = await supabase.from("workers").delete().eq("email", email);
+  const { error: facilityDel } = await supabase.from("facilities").delete().eq("email", email);
+
+  if (workerDel || facilityDel) {
+    log("error", "Account delete error", { workerError: workerDel?.message, facilityError: facilityDel?.message });
+  }
+
+  const { error: authError } = await supabase.auth.admin.deleteUser(user.id);
+  if (authError) {
+    log("error", "Auth delete error", { error: authError.message });
+    return res.status(500).json({ success: false, message: "Account data removed but auth deletion failed. Contact support." });
+  }
+
+  log("info", "Account deleted", { email });
+  return res.json({ success: true, message: "Account permanently deleted." });
+});
+
+app.get("/shifts/history", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const { data: worker } = await supabase
+    .from("workers")
+    .select("id, email")
+    .eq("email", user.email)
+    .maybeSingle();
+
+  if (worker) {
+    const { data, error } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("worker_id", worker.id)
+      .eq("status", "completed")
+      .order("completion_time", { ascending: false });
+
+    if (error) return res.status(500).json({ success: false, message: "Failed to load history." });
+    return res.json({ success: true, role: "worker", data: data || [] });
+  }
+
+  const { data: facility } = await supabase
+    .from("facilities")
+    .select("id, email")
+    .eq("email", user.email)
+    .maybeSingle();
+
+  if (facility) {
+    const { data, error } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("contact_email", user.email)
+      .eq("status", "completed")
+      .order("completion_time", { ascending: false });
+
+    if (error) return res.status(500).json({ success: false, message: "Failed to load history." });
+    return res.json({ success: true, role: "facility", data: data || [] });
+  }
+
+  return res.json({ success: true, role: "unknown", data: [] });
+});
+
 process.on("SIGTERM", async () => {
   await browserPool.close();
   process.exit(0);
