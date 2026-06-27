@@ -1986,6 +1986,503 @@ app.get("/worker/availability", async (req, res) => {
   }
 });
 
+app.post("/shift/cancel", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const shift_id = sanitize(req.body.shift_id);
+    const worker_id = sanitize(req.body.worker_id);
+    const reason = sanitize(req.body.reason);
+
+    if (!shift_id || !worker_id) {
+      return res.status(400).json({ success: false, message: "shift_id and worker_id are required." });
+    }
+
+    const { data: shift } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("id", shift_id)
+      .single();
+
+    if (!shift) {
+      return res.status(404).json({ success: false, message: "Shift not found." });
+    }
+
+    if (shift.status !== "accepted" && shift.status !== "in_progress") {
+      return res.status(400).json({ success: false, message: `Cannot cancel shift with status "${shift.status}".` });
+    }
+
+    if (shift.worker_id !== worker_id) {
+      return res.status(403).json({ success: false, message: "This worker is not assigned to this shift." });
+    }
+
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("id, email")
+      .eq("id", worker_id)
+      .single();
+
+    if (!worker || worker.email.toLowerCase() !== user.email.toLowerCase()) {
+      return res.status(403).json({ success: false, message: "You do not own this worker profile." });
+    }
+
+    const { error: cancelError } = await supabase
+      .from("shifts")
+      .update({ status: "open", worker_id: null, qr_token: null })
+      .eq("id", shift_id);
+
+    if (cancelError) {
+      return res.status(500).json({ success: false, message: "Failed to cancel shift." });
+    }
+
+    log("info", "Shift cancelled", { shift_id, worker_id, reason: reason || "No reason provided" });
+
+    let replacement = null;
+
+    const matchConditions = { role: shift.role_needed, city: shift.city, available_for_work: true, identity_verified: true };
+    if (isPharmacyRole(shift.role_needed)) {
+      matchConditions.license_verified = true;
+    }
+
+    let query = supabase
+      .from("workers")
+      .select("id, full_name, email, role, city")
+      .eq("role", shift.role_needed)
+      .eq("city", shift.city)
+      .eq("available_for_work", true)
+      .eq("identity_verified", true);
+
+    if (isPharmacyRole(shift.role_needed)) {
+      query = query.eq("license_verified", true);
+    }
+
+    const { data: availableWorkers } = await query.limit(5);
+
+    if (availableWorkers && availableWorkers.length > 0) {
+      const candidate = availableWorkers[0];
+      const newQrToken = generateQrToken();
+
+      const { data: assignedShift, error: assignError } = await supabase
+        .from("shifts")
+        .update({ worker_id: candidate.id, qr_token: newQrToken, status: "accepted" })
+        .eq("id", shift_id)
+        .select()
+        .single();
+
+      if (!assignError && assignedShift) {
+        replacement = { worker_name: candidate.full_name };
+
+        await supabase.from("notifications").insert([{
+          email: candidate.email.toLowerCase(),
+          title: "Shift assigned",
+          message: `You've been auto-assigned to a shift at ${shift.facility_name} on ${shift.shift_date}`,
+          type: "info",
+          read: false,
+          created_at: new Date().toISOString()
+        }]);
+
+        const { data: updatedShift } = await supabase
+          .from("shifts")
+          .select("*")
+          .eq("id", shift_id)
+          .single();
+
+        return res.json({ success: true, message: "Shift cancelled. Replacement worker assigned.", replacement, shift: updatedShift });
+      }
+    }
+
+    const { data: updatedShift } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("id", shift_id)
+      .single();
+
+    return res.json({ success: true, message: "Shift cancelled. No replacement found. Shift returned to open.", replacement: null, shift: updatedShift });
+  } catch (err) {
+    log("error", "Shift cancel error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to cancel shift." });
+  }
+});
+
+app.post("/invitations", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { worker_email, shift_id, message } = req.body;
+    const cleanWorkerEmail = sanitize(worker_email);
+    const cleanShiftId = sanitize(shift_id);
+    const cleanMessage = sanitize(message || "");
+
+    if (!cleanWorkerEmail || !cleanShiftId) {
+      return res.status(400).json({ success: false, message: "worker_email and shift_id are required." });
+    }
+
+    const { data: facility } = await supabase
+      .from("facilities")
+      .select("id, facility_name")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!facility) {
+      return res.status(403).json({ success: false, message: "Facility profile not found." });
+    }
+
+    const { data: shift } = await supabase
+      .from("shifts")
+      .select("id, contact_email, shift_date, facility_name")
+      .eq("id", cleanShiftId)
+      .single();
+
+    if (!shift) {
+      return res.status(404).json({ success: false, message: "Shift not found." });
+    }
+
+    if (shift.contact_email.toLowerCase() !== user.email.toLowerCase()) {
+      return res.status(403).json({ success: false, message: "This shift does not belong to your facility." });
+    }
+
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("id")
+      .eq("email", cleanWorkerEmail)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker not found with that email." });
+    }
+
+    const { data: existingApp } = await supabase
+      .from("applications")
+      .select("id")
+      .eq("worker_id", worker.id)
+      .eq("shift_id", cleanShiftId)
+      .maybeSingle();
+
+    if (existingApp) {
+      return res.status(400).json({ success: false, message: "Worker has already applied or been invited to this shift." });
+    }
+
+    const { data, error } = await supabase
+      .from("applications")
+      .insert([{ worker_id: worker.id, shift_id: cleanShiftId, status: "invited", cover_note: cleanMessage }])
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to create invitation." });
+    }
+
+    await supabase.from("notifications").insert([{
+      email: cleanWorkerEmail.toLowerCase(),
+      title: "You've been invited!",
+      message: `${facility.facility_name} has invited you to a shift on ${shift.shift_date}`,
+      type: "info",
+      read: false,
+      created_at: new Date().toISOString()
+    }]);
+
+    log("info", "Invitation sent", { worker_email: cleanWorkerEmail, shift_id: cleanShiftId });
+    return res.json({ success: true, data });
+  } catch (err) {
+    log("error", "Create invitation error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to send invitation." });
+  }
+});
+
+app.get("/invitations", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("id")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    const { data, error } = await supabase
+      .from("applications")
+      .select(`*, shifts(id, facility_name, city, role_needed, shift_date, start_time, duration, pay_rate)`)
+      .eq("worker_id", worker.id)
+      .eq("status", "invited")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load invitations." });
+    }
+
+    return res.json({ success: true, data: data || [] });
+  } catch (err) {
+    log("error", "Get invitations error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load invitations." });
+  }
+});
+
+app.post("/invitations/respond", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const application_id = sanitize(req.body.application_id);
+    const response = sanitize(req.body.response);
+
+    if (!application_id || !response || !["accepted", "rejected"].includes(response)) {
+      return res.status(400).json({ success: false, message: "application_id and response (accepted/rejected) are required." });
+    }
+
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("id, full_name")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    const { data: application } = await supabase
+      .from("applications")
+      .select(`*, shifts(*)`)
+      .eq("id", application_id)
+      .single();
+
+    if (!application) {
+      return res.status(404).json({ success: false, message: "Application not found." });
+    }
+
+    if (application.worker_id !== worker.id) {
+      return res.status(403).json({ success: false, message: "This invitation does not belong to you." });
+    }
+
+    if (application.status !== "invited") {
+      return res.status(400).json({ success: false, message: `This invitation is no longer valid (status: ${application.status}).` });
+    }
+
+    if (response === "accepted") {
+      const qrToken = generateQrToken();
+
+      await supabase
+        .from("applications")
+        .update({ status: "accepted", responded_at: new Date().toISOString() })
+        .eq("id", application_id);
+
+      await supabase
+        .from("shifts")
+        .update({ worker_id: worker.id, qr_token: qrToken, status: "accepted" })
+        .eq("id", application.shift_id);
+
+      await supabase
+        .from("applications")
+        .update({ status: "rejected", responded_at: new Date().toISOString() })
+        .eq("shift_id", application.shift_id)
+        .eq("status", "invited")
+        .neq("id", application_id);
+
+      await supabase.from("notifications").insert([{
+        email: application.shifts.contact_email.toLowerCase(),
+        title: "Invitation accepted",
+        message: `${worker.full_name} has accepted your invitation for ${application.shifts.shift_date}`,
+        type: "success",
+        read: false,
+        created_at: new Date().toISOString()
+      }]);
+
+      log("info", "Invitation accepted", { application_id, worker_id: worker.id });
+      return res.json({ success: true, data: { ...application, status: "accepted" } });
+    }
+
+    await supabase
+      .from("applications")
+      .update({ status: "rejected", responded_at: new Date().toISOString() })
+      .eq("id", application_id);
+
+    await supabase.from("notifications").insert([{
+      email: application.shifts.contact_email.toLowerCase(),
+      title: "Invitation rejected",
+      message: `${worker.full_name} has rejected your invitation for ${application.shifts.shift_date}`,
+      type: "warning",
+      read: false,
+      created_at: new Date().toISOString()
+    }]);
+
+    log("info", "Invitation rejected", { application_id, worker_id: worker.id });
+    return res.json({ success: true, data: { ...application, status: "rejected" } });
+  } catch (err) {
+    log("error", "Invitation respond error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to respond to invitation." });
+  }
+});
+
+app.get("/roles/rates", (req, res) => {
+  return res.json({
+    success: true,
+    rates: {
+      pharmacist: 80,
+      "pharmacy-tech": 45,
+      nurse: 60,
+      "medical-doctor": 120,
+      "lab-technician": 40,
+      caregiver: 25,
+      other: 35
+    },
+    currency: "GHS"
+  });
+});
+
+app.post("/support/ticket", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const subject = sanitize(req.body.subject);
+    const message = sanitize(req.body.message);
+    const category = sanitize(req.body.category || "general");
+
+    const validCategories = ["general", "payment", "shift", "account", "technical"];
+    const cleanCategory = validCategories.includes(category) ? category : "general";
+
+    if (!subject || !message) {
+      return res.status(400).json({ success: false, message: "subject and message are required." });
+    }
+
+    const { data, error } = await supabase
+      .from("support_tickets")
+      .insert([{
+        email: user.email.toLowerCase(),
+        subject,
+        message,
+        category: cleanCategory,
+        status: "open",
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to create support ticket." });
+    }
+
+    await supabase.from("notifications").insert([{
+      email: user.email.toLowerCase(),
+      title: "Support ticket received",
+      message: "We've received your request and will respond within 24 hours.",
+      type: "info",
+      read: false,
+      created_at: new Date().toISOString()
+    }]);
+
+    log("info", "Support ticket created", { email: user.email, subject });
+    return res.json({ success: true, data });
+  } catch (err) {
+    log("error", "Support ticket error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to create support ticket." });
+  }
+});
+
+app.get("/support/tickets", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const { data, error } = await supabase
+      .from("support_tickets")
+      .select("*")
+      .eq("email", user.email.toLowerCase())
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ success: false, message: "Failed to load support tickets." });
+    }
+
+    return res.json({ success: true, data: data || [] });
+  } catch (err) {
+    log("error", "Support tickets fetch error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load support tickets." });
+  }
+});
+
+app.post("/shift/instant-pay", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const shift_id = sanitize(req.body.shift_id);
+    const fee_accepted = req.body.fee_accepted === true;
+
+    if (!shift_id) {
+      return res.status(400).json({ success: false, message: "shift_id is required." });
+    }
+
+    if (!fee_accepted) {
+      return res.status(400).json({ success: false, message: "Please accept the instant pay fee, or use the standard free payout (2-3 business days)." });
+    }
+
+    const { data: worker } = await supabase
+      .from("workers")
+      .select("id, full_name, email, phone, paystack_recipient_code")
+      .eq("email", user.email)
+      .maybeSingle();
+
+    if (!worker) {
+      return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    const { data: shift } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("id", shift_id)
+      .single();
+
+    if (!shift) {
+      return res.status(404).json({ success: false, message: "Shift not found." });
+    }
+
+    if (shift.worker_id !== worker.id) {
+      return res.status(403).json({ success: false, message: "This shift does not belong to you." });
+    }
+
+    if (shift.status !== "completed") {
+      return res.status(400).json({ success: false, message: "Shift must be completed before payout." });
+    }
+
+    if (shift.payout_status === "paid" || shift.payout_status === "instant_paid") {
+      return res.status(400).json({ success: false, message: "This shift has already been paid out." });
+    }
+
+    const totalPay = parsePayAmount(shift.total_pay);
+    const fee = Math.max(Math.round(totalPay * 0.025 * 100) / 100, 1);
+    const net = Math.round((totalPay - fee) * 100) / 100;
+
+    const { transfer_code } = await initiateWorkerPayout({ ...worker, id: worker.id }, { ...shift, total_pay: `GHS ${net}` });
+
+    await supabase
+      .from("shifts")
+      .update({ payout_status: "instant_paid", payout_reference: transfer_code, payout_fee: fee, payout_instant: true })
+      .eq("id", shift_id);
+
+    await supabase.from("notifications").insert([{
+      email: user.email.toLowerCase(),
+      title: "Instant payout sent!",
+      message: `GHS ${net} sent to your Mobile Money. Fee: GHS ${fee}`,
+      type: "success",
+      read: false,
+      created_at: new Date().toISOString()
+    }]);
+
+    log("info", "Instant payout processed", { shift_id, worker_id: worker.id, amount: totalPay, fee, net });
+    return res.json({ success: true, message: `GHS ${net} sent to your Mobile Money.`, amount: totalPay, fee, net });
+  } catch (err) {
+    log("error", "Instant payout error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to process instant payout." });
+  }
+});
+
 process.on("SIGTERM", async () => {
   await browserPool.close();
   process.exit(0);
