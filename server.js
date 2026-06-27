@@ -1260,7 +1260,7 @@ app.put("/worker", async (req, res) => {
   if (license_number) updates.license_number = sanitize(license_number);
   if (city) updates.city = sanitize(city);
   if (experience) updates.experience = sanitize(experience);
-  if (profile_photo_url !== undefined) updates.profile_photo_url = profile_photo_url;
+  if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
 
   const { error } = await supabase.from("workers").update(updates).eq("id", existing.id);
 
