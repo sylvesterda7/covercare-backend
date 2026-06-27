@@ -26,7 +26,7 @@ app.use(cors({
     "http://localhost:5501",
     "http://127.0.0.1:5501"
   ],
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "PUT"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
