@@ -257,7 +257,7 @@ app.post("/worker", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { full_name, email, phone, role, license_number, city, experience } = body;
+  const { full_name, email, phone, role, license_number, city, experience, profile_photo_url } = body;
 
   if (!full_name || !email || !phone || !role || !city) {
     return res.status(400).json({ success: false, message: "full_name, email, phone, role, and city are required." });
@@ -267,9 +267,12 @@ app.post("/worker", async (req, res) => {
     return res.status(403).json({ success: false, message: "Email does not match your authenticated account." });
   }
 
-  const { error } = await supabase.from("workers").insert([{
+  const insertData = {
     full_name, email, phone, role, license_number, license_verified: false, city, experience
-  }]);
+  };
+  if (profile_photo_url) insertData.profile_photo_url = profile_photo_url;
+
+  const { error } = await supabase.from("workers").insert([insertData]);
 
   if (error) {
     log("error", "Worker save error", { error: error.message });
@@ -1234,7 +1237,7 @@ app.put("/worker", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { full_name, phone, role, license_number, city, experience } = req.body;
+  const { full_name, phone, role, license_number, city, experience, profile_photo_url } = req.body;
 
   const { data: existing } = await supabase
     .from("workers")
@@ -1253,6 +1256,7 @@ app.put("/worker", async (req, res) => {
   if (license_number) updates.license_number = sanitize(license_number);
   if (city) updates.city = sanitize(city);
   if (experience) updates.experience = sanitize(experience);
+  if (profile_photo_url !== undefined) updates.profile_photo_url = profile_photo_url;
 
   const { error } = await supabase.from("workers").update(updates).eq("id", existing.id);
 
