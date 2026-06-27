@@ -289,15 +289,20 @@ app.post("/facility", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { facility_name, facility_type, city, contact_name, contact_role, email, phone, staff_needs, frequency } = body;
+  const { facility_name, facility_type, city, contact_name, contact_role, email, phone, staff_needs, frequency, incorporation_doc_url, hefra_license_url, pharmacy_council_url } = body;
 
   if (user.email.toLowerCase() !== email.toLowerCase()) {
     return res.status(403).json({ success: false, message: "Email does not match your authenticated account." });
   }
 
-  const { error } = await supabase.from("facilities").insert([{
+  const insertData = {
     facility_name, facility_type, city, contact_name, contact_role, email, phone, staff_needs, frequency
-  }]);
+  };
+  if (incorporation_doc_url) insertData.incorporation_doc_url = incorporation_doc_url;
+  if (hefra_license_url) insertData.hefra_license_url = hefra_license_url;
+  if (pharmacy_council_url) insertData.pharmacy_council_url = pharmacy_council_url;
+
+  const { error } = await supabase.from("facilities").insert([insertData]);
 
   if (error) {
     log("error", "Facility save error", { error: error.message });
@@ -845,7 +850,7 @@ app.post("/applications/apply", async (req, res) => {
 
   const { data: shift } = await supabase
     .from("shifts")
-    .select("id, status")
+    .select("id, status, contact_email, role_needed, shift_date")
     .eq("id", shift_id)
     .single();
 
@@ -874,6 +879,15 @@ app.post("/applications/apply", async (req, res) => {
     log("error", "Application error", { error: error.message });
     return res.status(500).json({ success: false, message: "Failed to submit application." });
   }
+
+  await supabase.from("notifications").insert([{
+    email: shift.contact_email?.toLowerCase(),
+    title: "New application received",
+    message: `A worker has applied for ${shift.role_needed} on ${shift.shift_date}`,
+    type: "info",
+    read: false,
+    created_at: new Date().toISOString()
+  }]).catch(() => {});
 
   log("info", "Application submitted", { worker_id, shift_id });
   return res.json({ success: true, message: "Application submitted successfully.", data });
@@ -1077,6 +1091,83 @@ app.post("/admin/verify", async (req, res) => {
   return res.json({ success: true, admin: isAdmin, email: user.email });
 });
 
+app.get("/admin/analytics", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const now = new Date();
+    const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+
+    const months = [];
+    for (let i = 5; i >= 0; i--) {
+      const start = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const end = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
+      months.push({
+        label: start.toLocaleString("default", { month: "short", year: "2-digit" }),
+        start: start.toISOString(),
+        end: end.toISOString()
+      });
+    }
+
+    const { data: allWorkers } = await supabase.from("workers").select("created_at");
+    const { data: allFacilities } = await supabase.from("facilities").select("created_at");
+    const { data: allShifts } = await supabase.from("shifts").select("created_at, total_pay, payment_status, status");
+    const { data: allRatings } = await supabase.from("ratings").select("rating");
+    const { data: supportTickets } = await supabase.from("support_tickets").select("status");
+    const { data: allApps } = await supabase.from("applications").select("status");
+
+    const workerCountByMonth = months.map(m => ({
+      month: m.label,
+      count: (allWorkers || []).filter(w => w.created_at && w.created_at >= m.start && w.created_at < m.end).length
+    }));
+
+    const shiftCountByMonth = months.map(m => ({
+      month: m.label,
+      count: (allShifts || []).filter(s => s.created_at && s.created_at >= m.start && s.created_at < m.end).length
+    }));
+
+    const revenueByMonth = months.map(m => ({
+      month: m.label,
+      amount: (allShifts || []).filter(s => s.created_at && s.created_at >= m.start && s.created_at < m.end && s.payment_status === "paid").reduce((sum, s) => {
+        return sum + (parseFloat((s.total_pay || "").replace(/[^0-9.]/g, "")) || 0) * 0.25;
+      }, 0)
+    }));
+
+    const avgRating = allRatings && allRatings.length > 0
+      ? (allRatings.reduce((s, r) => s + (r.rating || 0), 0) / allRatings.length).toFixed(1)
+      : "—";
+
+    const pendingApps = (allApps || []).filter(a => a.status === "pending").length;
+
+    const openTickets = (supportTickets || []).filter(t => t.status === "open").length;
+
+    const { count: verifiedCount } = await supabase.from("workers").select("id", { count: "exact", head: true }).eq("license_verified", true);
+    const { count: identityVerifiedCount } = await supabase.from("workers").select("id", { count: "exact", head: true }).eq("identity_verified", true);
+    const { count: unverifiedCount } = await supabase.from("workers").select("id", { count: "exact", head: true }).eq("license_verified", false);
+
+    const activeShifts = (allShifts || []).filter(s => s.status === "in_progress" || s.status === "accepted").length;
+
+    return res.json({
+      success: true,
+      workersByMonth: workerCountByMonth,
+      shiftsByMonth: shiftCountByMonth,
+      revenueByMonth,
+      avgRating,
+      pendingApplications: pendingApps,
+      openSupportTickets: openTickets,
+      verifiedWorkersCount: verifiedCount || 0,
+      identityVerifiedCount: identityVerifiedCount || 0,
+      unverifiedCount: unverifiedCount || 0,
+      activeShifts
+    });
+  } catch (err) {
+    log("error", "Admin analytics error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load analytics." });
+  }
+});
+
 app.post("/admin/toggle-license", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
@@ -1178,7 +1269,7 @@ app.put("/facility", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { facility_name, facility_type, city, contact_name, contact_role, phone, staff_needs, frequency } = req.body;
+  const { facility_name, facility_type, city, contact_name, contact_role, phone, staff_needs, frequency, incorporation_doc_url, hefra_license_url, pharmacy_council_url } = req.body;
 
   const { data: existing } = await supabase
     .from("facilities")
@@ -1199,6 +1290,9 @@ app.put("/facility", async (req, res) => {
   if (phone) updates.phone = sanitize(phone);
   if (staff_needs) updates.staff_needs = sanitize(staff_needs);
   if (frequency) updates.frequency = sanitize(frequency);
+  if (req.body.incorporation_doc_url) updates.incorporation_doc_url = req.body.incorporation_doc_url;
+  if (req.body.hefra_license_url) updates.hefra_license_url = req.body.hefra_license_url;
+  if (req.body.pharmacy_council_url) updates.pharmacy_council_url = req.body.pharmacy_council_url;
 
   const { error } = await supabase.from("facilities").update(updates).eq("id", existing.id);
 
@@ -1724,6 +1818,15 @@ app.post("/ratings", async (req, res) => {
       return res.status(500).json({ success: false, message: "Failed to submit rating." });
     }
 
+    await supabase.from("notifications").insert([{
+      email: target_email.toLowerCase(),
+      title: "New rating received",
+      message: `You received a ${ratingNum}/5 rating for your shift at ${shift.facility_name}.`,
+      type: "info",
+      read: false,
+      created_at: new Date().toISOString()
+    }]).catch(() => {});
+
     log("info", "Rating created", { shift_id, rater: raterEmail, target: target_email });
     return res.json({ success: true, data });
   } catch (err) {
@@ -2036,7 +2139,16 @@ app.post("/shift/cancel", async (req, res) => {
       return res.status(500).json({ success: false, message: "Failed to cancel shift." });
     }
 
-    log("info", "Shift cancelled", { shift_id, worker_id, reason: reason || "No reason provided" });
+    await supabase.from("notifications").insert([{
+    email: shift.contact_email?.toLowerCase(),
+    title: "Shift cancelled by worker",
+    message: `A worker cancelled for ${shift.role_needed} on ${shift.shift_date}. Reason: ${reason || "Not provided"}.`,
+    type: "warning",
+    read: false,
+    created_at: new Date().toISOString()
+  }]).catch(() => {});
+
+  log("info", "Shift cancelled", { shift_id, worker_id, reason: reason || "No reason provided" });
 
     let replacement = null;
 
