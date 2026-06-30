@@ -557,6 +557,7 @@ app.post("/payment/verify", async (req, res) => {
     }
 
     const shiftFields = pickShiftFields(rawShiftData);
+    shiftFields.contact_email = user.email;
     const { workerTotal, facilityTotal } = computeShiftAmounts(shiftFields);
     const paidAmount = data.data.amount / 100;
 
