@@ -2793,6 +2793,55 @@ app.post("/shift/instant-pay", async (req, res) => {
   }
 });
 
+// ── Send email notification ──
+app.post("/notifications/send-email", async (req, res) => {
+  try {
+    const { to, subject, body } = req.body;
+    if (!to || !subject || !body) {
+      return res.status(400).json({ success: false, message: "to, subject, and body are required." });
+    }
+
+    if (!process.env.RESEND_API_KEY) {
+      log("warn", "RESEND_API_KEY not set — storing email notification in DB");
+      await supabase.from("notifications").insert([{
+        email: to.toLowerCase(),
+        title: subject,
+        message: body,
+        type: "email",
+        read: false,
+        created_at: new Date().toISOString()
+      }]).catch(() => {});
+      return res.json({ success: true, message: "Notification stored (email not sent — no Resend key)." });
+    }
+
+    const emailRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: "CoverCare Africa <notifications@covercareafrica.com>",
+        to: [to],
+        subject,
+        html: body
+      })
+    });
+
+    const emailData = await emailRes.json();
+    if (!emailRes.ok) {
+      log("error", "Resend email failed", { error: emailData });
+      return res.status(500).json({ success: false, message: "Failed to send email." });
+    }
+
+    log("info", "Email sent via Resend", { to, subject });
+    return res.json({ success: true, message: "Email sent." });
+  } catch (err) {
+    log("error", "Send email error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to send email." });
+  }
+});
+
 process.on("SIGTERM", async () => {
   await browserPool.close();
   process.exit(0);
