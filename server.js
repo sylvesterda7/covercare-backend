@@ -984,9 +984,10 @@ app.post("/applications/accept", async (req, res) => {
     .eq("status", "pending")
     .neq("id", application_id);
 
+  const qrToken = generateQrToken();
   await supabase
     .from("shifts")
-    .update({ status: "accepted", worker_id: application.worker_id })
+    .update({ status: "accepted", worker_id: application.worker_id, qr_token: qrToken })
     .eq("id", application.shift_id);
 
   log("info", "Application accepted", { application_id, facility_email });
