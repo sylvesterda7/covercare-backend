@@ -990,7 +990,7 @@ app.post("/applications/accept", async (req, res) => {
     .eq("id", application.shift_id);
 
   log("info", "Application accepted", { application_id, facility_email });
-  return res.json({ success: true, message: "Application accepted. Worker assigned to shift.", data });
+  return res.json({ success: true, message: "Application accepted. Worker assigned to shift.", data, worker: application.workers });
 });
 
 app.post("/applications/reject", async (req, res) => {
