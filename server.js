@@ -1517,7 +1517,11 @@ app.get("/matches/facility", async (req, res) => {
         })
         .sort((a, b) => b.score - a.score);
 
-      matches[shift.id] = matchedWorkers;
+      matches[shift.id] = matchedWorkers.map(m => ({
+        ...m,
+        role_needed: shift.role_needed,
+        shift_date: shift.shift_date
+      }));
     }
 
     return res.json({ success: true, matches });
