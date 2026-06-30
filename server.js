@@ -1734,6 +1734,78 @@ app.get("/payroll/payslip/:shift_id", async (req, res) => {
   }
 });
 
+// ── Finance / payout profile ──
+app.get("/finance/worker/profile", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: worker } = await supabase.from("workers").select("id, full_name, phone, bank_name, bank_account_number, bank_account_name, momo_provider, momo_number, paystack_recipient_code").eq("email", user.email).maybeSingle();
+    if (!worker) return res.status(404).json({ success: false, message: "Worker not found." });
+    return res.json({ success: true, data: worker });
+  } catch (err) {
+    log("error", "Finance profile error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load finance profile." });
+  }
+});
+
+app.post("/finance/worker/profile", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { bank_name, bank_account_number, bank_account_name, momo_provider, momo_number } = req.body;
+    const { data: worker } = await supabase.from("workers").select("id").eq("email", user.email).maybeSingle();
+    if (!worker) return res.status(404).json({ success: false, message: "Worker not found." });
+    const updates = {};
+    if (bank_name !== undefined) updates.bank_name = sanitize(bank_name);
+    if (bank_account_number !== undefined) updates.bank_account_number = sanitize(bank_account_number);
+    if (bank_account_name !== undefined) updates.bank_account_name = sanitize(bank_account_name);
+    if (momo_provider !== undefined) updates.momo_provider = sanitize(momo_provider);
+    if (momo_number !== undefined) updates.momo_number = sanitize(momo_number);
+    const { error } = await supabase.from("workers").update(updates).eq("id", worker.id);
+    if (error) return res.status(500).json({ success: false, message: "Failed to save payout profile." });
+    return res.json({ success: true, message: "Payout profile saved." });
+  } catch (err) {
+    log("error", "Finance profile save error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to save payout profile." });
+  }
+});
+
+app.get("/finance/worker/transactions", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: worker } = await supabase.from("workers").select("id").eq("email", user.email).maybeSingle();
+    if (!worker) return res.status(404).json({ success: false, message: "Worker not found." });
+    const { data: shifts } = await supabase.from("shifts").select("*").eq("worker_id", worker.id).eq("status", "completed").order("completion_time", { ascending: false });
+    const now = new Date();
+    const monthly = {};
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = d.toISOString().substring(0, 7);
+      monthly[key] = 0;
+    }
+    const transactions = (shifts || []).map(s => {
+      const amt = parsePayAmount(s.total_pay);
+      const mKey = s.completion_time ? s.completion_time.substring(0, 7) : null;
+      if (mKey && monthly[mKey] !== undefined) monthly[mKey] += amt;
+      return {
+        id: s.id,
+        facility_name: s.facility_name,
+        role_needed: s.role_needed,
+        shift_date: s.shift_date,
+        completion_time: s.completion_time,
+        amount: amt,
+        payout_status: s.payout_status || "pending",
+        payout_reference: s.payout_reference
+      };
+    });
+    return res.json({ success: true, data: { transactions, monthly, total: transactions.reduce((sum, t) => sum + t.amount, 0) } });
+  } catch (err) {
+    log("error", "Finance transactions error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load transactions." });
+  }
+});
+
 app.post("/ratings", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
