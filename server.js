@@ -163,6 +163,40 @@ function buildQrUrl(shiftId, workerId, token) {
   return `${ARRIVE_BASE_URL}?${params.toString()}`;
 }
 
+const GRACE_PERIOD_MINUTES = 15;
+
+function getShiftStartTime(shift) {
+  if (!shift.shift_date || !shift.start_time) return null;
+  const d = new Date(`${shift.shift_date}T${shift.start_time}:00`);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function getShiftDurationHours(shift) {
+  return parseFloat((shift.duration || "").replace(/[^0-9.]/g, "")) || 0;
+}
+
+function getShiftEndTime(shift) {
+  const start = getShiftStartTime(shift);
+  if (!start) return null;
+  const hours = getShiftDurationHours(shift);
+  return new Date(start.getTime() + hours * 60 * 60 * 1000);
+}
+
+function calcLateMinutes(shift, arrivalDate) {
+  const start = getShiftStartTime(shift);
+  if (!start) return 0;
+  const late = Math.round((arrivalDate.getTime() - start.getTime()) / 60000) - GRACE_PERIOD_MINUTES;
+  return Math.max(0, late);
+}
+
+function calcAdjustedPay(totalPay, durationHours, lateMinutes) {
+  if (!totalPay || !durationHours || durationHours <= 0) return totalPay;
+  const hourlyRate = parsePayAmount(totalPay) / durationHours;
+  const deduction = hourlyRate * (lateMinutes / 60);
+  const adjusted = Math.max(0, parsePayAmount(totalPay) - deduction);
+  return `GHS ${adjusted.toLocaleString()}`;
+}
+
 function parsePayAmount(totalPay) {
   if (!totalPay) return 0;
   return parseFloat(totalPay.toString().replace(/[^0-9.]/g, "")) || 0;
@@ -172,20 +206,6 @@ async function getShiftById(shiftId) {
   const { data, error } = await supabase.from("shifts").select("*").eq("id", shiftId).single();
   if (error || !data) return null;
   return data;
-}
-
-function getShiftEndTime(shift) {
-  if (!shift.shift_date || !shift.start_time) return null;
-  const start = new Date(`${shift.shift_date}T${shift.start_time}:00`);
-  if (isNaN(start.getTime())) return null;
-  const hours = parseFloat((shift.duration || "").replace(/[^0-9.]/g, "")) || 0;
-  return new Date(start.getTime() + hours * 60 * 60 * 1000);
-}
-
-function isShiftWindowPassed(shift) {
-  const end = getShiftEndTime(shift);
-  if (!end) return false;
-  return new Date() > end;
 }
 
 async function validateQrCredentials(shiftId, workerId, token) {
@@ -770,11 +790,21 @@ app.post("/shift/arrive", async (req, res) => {
     return res.status(400).json({ success: false, message: `Cannot check in — shift status is "${shift.status}".` });
   }
 
-  const arrivalTime = new Date().toISOString();
+  const arrivalTime = new Date();
+  const lateMinutes = calcLateMinutes(shift, arrivalTime);
+  const durationHours = getShiftDurationHours(shift);
+  const adjustedPay = lateMinutes > 0 ? calcAdjustedPay(shift.total_pay, durationHours, lateMinutes) : shift.total_pay;
+
+  const updateFields = {
+    arrival_time: arrivalTime.toISOString(),
+    status: "in_progress",
+    late_minutes: lateMinutes
+  };
+  if (lateMinutes > 0) updateFields.adjusted_pay = adjustedPay;
 
   const { data, error } = await supabase
     .from("shifts")
-    .update({ arrival_time: arrivalTime, status: "in_progress" })
+    .update(updateFields)
     .eq("id", shiftId)
     .eq("status", "accepted")
     .select()
@@ -791,11 +821,15 @@ app.post("/shift/arrive", async (req, res) => {
     .eq("id", workerId)
     .single();
 
-  log("info", "Worker arrived", { shiftId, workerId, arrivalTime });
+  log("info", "Worker arrived", { shiftId, workerId, arrivalTime: arrivalTime.toISOString(), lateMinutes });
   return res.json({
     success: true,
-    message: "Arrival confirmed. Shift is now in progress.",
-    arrival_time: arrivalTime,
+    message: lateMinutes > 0
+      ? `Arrival confirmed. You arrived ${lateMinutes} min late — pay adjusted to ${adjustedPay}.`
+      : "Arrival confirmed. Shift is now in progress.",
+    arrival_time: arrivalTime.toISOString(),
+    late_minutes: lateMinutes,
+    adjusted_pay: adjustedPay,
     worker,
     shift: data
   });
@@ -840,11 +874,41 @@ app.post("/shift/complete", async (req, res) => {
     }
   }
 
-  const completionTime = new Date().toISOString();
+  const completionTime = new Date();
+  const arrivalDate = shift.arrival_time ? new Date(shift.arrival_time) : null;
+  const scheduledEnd = getShiftEndTime(shift);
+  let finalPay = shift.total_pay;
+  let madeUp = false;
+  let actualMinutes = 0;
+
+  if (arrivalDate && scheduledEnd) {
+    actualMinutes = Math.round((completionTime.getTime() - arrivalDate.getTime()) / 60000);
+    const durationHours = getShiftDurationHours(shift);
+    const scheduledMinutes = durationHours * 60;
+
+    // Check if worker stayed late enough to make up for late arrival
+    if (shift.late_minutes > 0) {
+      const extraMinutes = Math.max(0, actualMinutes - scheduledMinutes);
+      if (extraMinutes >= shift.late_minutes) {
+        madeUp = true;
+        finalPay = shift.total_pay;
+      } else {
+        finalPay = shift.adjusted_pay || shift.total_pay;
+      }
+    }
+  }
+
+  const completeFields = {
+    completion_time: completionTime.toISOString(),
+    status: "completed",
+    actual_hours: Math.round(actualMinutes / 6) / 10,
+    made_up: madeUp
+  };
+  if (finalPay) completeFields.adjusted_pay = finalPay;
 
   const { data, error } = await supabase
     .from("shifts")
-    .update({ completion_time: completionTime, status: "completed" })
+    .update(completeFields)
     .eq("id", shiftId)
     .eq("status", "in_progress")
     .select()
@@ -877,11 +941,24 @@ app.post("/shift/complete", async (req, res) => {
     }
   }
 
-  log("info", "Shift completed", { shiftId, workerId, completionTime, payout: payout ? "sent" : "failed" });
+  let completeMsg = "";
+  if (madeUp) {
+    completeMsg = `You stayed late and made up for the late arrival — full pay of ${finalPay} retained.`;
+  } else if (shift.late_minutes > 0) {
+    completeMsg = `Shift completed. Pay adjusted to ${finalPay} due to ${shift.late_minutes} min late arrival.`;
+  } else {
+    completeMsg = payout ? "Shift completed. Payout sent to worker's Mobile Money." : "Shift completed but payout failed — support will follow up.";
+  }
+
+  log("info", "Shift completed", { shiftId, workerId, completionTime: completionTime.toISOString(), payout: payout ? "sent" : "failed", lateMinutes: shift.late_minutes, madeUp });
   return res.json({
     success: true,
-    message: payout ? "Shift completed. Payout sent to worker's Mobile Money." : "Shift completed but payout failed — support will follow up.",
-    completion_time: completionTime,
+    message: completeMsg,
+    completion_time: completionTime.toISOString(),
+    late_minutes: shift.late_minutes || 0,
+    made_up: madeUp,
+    adjusted_pay: finalPay,
+    actual_hours: Math.round(actualMinutes / 6) / 10,
     payout: payout ? { amount: payout.amount, transfer_code: payout.transfer_code } : null,
     shift: data
   });
