@@ -1806,6 +1806,124 @@ app.get("/finance/worker/transactions", async (req, res) => {
   }
 });
 
+// ── Finance / wallet ──
+app.get("/finance/wallet", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: worker } = await supabase.from("workers").select("id").eq("email", user.email).maybeSingle();
+    if (!worker) return res.status(404).json({ success: false, message: "Worker not found." });
+
+    const { data: shifts } = await supabase.from("shifts").select("total_pay, payout_status").eq("worker_id", worker.id).eq("status", "completed");
+    let totalEarned = 0, autoPaid = 0;
+    for (const s of shifts || []) {
+      const amt = parsePayAmount(s.total_pay);
+      totalEarned += amt;
+      if (s.payout_status === "paid" || s.payout_status === "instant_paid") autoPaid += amt;
+    }
+
+    const { data: payouts } = await supabase.from("payout_requests").select("amount, status").eq("worker_id", worker.id);
+    let requested = 0, completedPayouts = 0;
+    for (const p of payouts || []) {
+      if (p.status === "completed") completedPayouts += p.amount;
+      if (p.status === "pending" || p.status === "processing") requested += p.amount;
+    }
+
+    const totalPaidOut = autoPaid + completedPayouts;
+    return res.json({
+      success: true,
+      data: {
+        total_earned: totalEarned,
+        auto_paid: autoPaid,
+        payout_requests_paid: completedPayouts,
+        pending_requests: requested,
+        available_balance: Math.max(0, totalEarned - totalPaidOut - requested)
+      }
+    });
+  } catch (err) {
+    log("error", "Wallet error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load wallet." });
+  }
+});
+
+// ── Finance / payout request ──
+app.post("/finance/payout/request", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { amount, method } = req.body;
+    if (!amount || amount <= 0) return res.status(400).json({ success: false, message: "Invalid amount." });
+    if (!method || !["bank", "momo"].includes(method)) return res.status(400).json({ success: false, message: "Invalid payment method." });
+
+    const { data: worker } = await supabase.from("workers").select("*").eq("email", user.email).maybeSingle();
+    if (!worker) return res.status(404).json({ success: false, message: "Worker not found." });
+
+    // Compute available balance
+    const { data: shifts } = await supabase.from("shifts").select("total_pay, payout_status").eq("worker_id", worker.id).eq("status", "completed");
+    let totalEarned = 0, autoPaid = 0;
+    for (const s of shifts || []) {
+      const amt = parsePayAmount(s.total_pay);
+      totalEarned += amt;
+      if (s.payout_status === "paid" || s.payout_status === "instant_paid") autoPaid += amt;
+    }
+    const { data: payouts } = await supabase.from("payout_requests").select("amount, status").eq("worker_id", worker.id);
+    let paidOut = 0, pendingReq = 0;
+    for (const p of payouts || []) {
+      if (p.status === "completed") paidOut += p.amount;
+      if (p.status === "pending" || p.status === "processing") pendingReq += p.amount;
+    }
+    const available = Math.max(0, totalEarned - autoPaid - paidOut - pendingReq);
+
+    if (amount > available) return res.status(400).json({ success: false, message: "Insufficient available balance." });
+
+    const fee = 0;
+    const netAmount = amount;
+
+    const payoutData = {
+      worker_id: worker.id,
+      amount,
+      fee,
+      net_amount: netAmount,
+      method,
+      status: "pending"
+    };
+    if (method === "bank") {
+      if (!worker.bank_name || !worker.bank_account_number || !worker.bank_account_name) return res.status(400).json({ success: false, message: "Bank account details not set. Go to Payment Methods first." });
+      payoutData.bank_name = worker.bank_name;
+      payoutData.bank_account_number = worker.bank_account_number;
+      payoutData.bank_account_name = worker.bank_account_name;
+    } else {
+      if (!worker.momo_provider || !worker.momo_number) return res.status(400).json({ success: false, message: "Mobile Money details not set. Go to Payment Methods first." });
+      payoutData.momo_provider = worker.momo_provider;
+      payoutData.momo_number = worker.momo_number;
+    }
+
+    const { data: created, error } = await supabase.from("payout_requests").insert(payoutData).select().single();
+    if (error) { log("error", "Payout request insert error", { error: error.message }); return res.status(500).json({ success: false, message: "Failed to create payout request." }); }
+
+    return res.json({ success: true, message: "Payout request submitted. It will be processed within 24 hours.", data: created });
+  } catch (err) {
+    log("error", "Payout request error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to create payout request." });
+  }
+});
+
+// ── Finance / payout history ──
+app.get("/finance/payout/history", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: worker } = await supabase.from("workers").select("id").eq("email", user.email).maybeSingle();
+    if (!worker) return res.status(404).json({ success: false, message: "Worker not found." });
+    const { data: requests, error } = await supabase.from("payout_requests").select("*").eq("worker_id", worker.id).order("created_at", { ascending: false });
+    if (error) return res.status(500).json({ success: false, message: "Failed to load payout history." });
+    return res.json({ success: true, data: requests || [] });
+  } catch (err) {
+    log("error", "Payout history error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load payout history." });
+  }
+});
+
 app.post("/ratings", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
