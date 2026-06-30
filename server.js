@@ -686,6 +686,38 @@ app.post("/shift/accept", async (req, res) => {
   });
 });
 
+app.get("/qr/validate", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const { shift_id, worker_id, token } = req.query;
+  if (!shift_id || !worker_id || !token) {
+    return res.status(400).json({ success: false, message: "Missing shift_id, worker_id, or token." });
+  }
+
+  const validation = await validateQrCredentials(shift_id, worker_id, token);
+  if (!validation.ok) {
+    return res.status(validation.status).json({ success: false, message: validation.message });
+  }
+
+  const { shift } = validation;
+  if (shift.contact_email?.toLowerCase() !== user.email.toLowerCase()) {
+    return res.status(403).json({ success: false, message: "This shift does not belong to your facility." });
+  }
+
+  const { data: worker } = await supabase
+    .from("workers")
+    .select("id, full_name, role, license_verified, identity_verified")
+    .eq("id", worker_id)
+    .single();
+
+  return res.json({
+    success: true,
+    shift: { role_needed: shift.role_needed, shift_date: shift.shift_date, start_time: shift.start_time },
+    worker
+  });
+});
+
 app.post("/shift/arrive", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
