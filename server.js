@@ -174,11 +174,26 @@ async function getShiftById(shiftId) {
   return data;
 }
 
+function getShiftEndTime(shift) {
+  if (!shift.shift_date || !shift.start_time) return null;
+  const start = new Date(`${shift.shift_date}T${shift.start_time}:00`);
+  if (isNaN(start.getTime())) return null;
+  const hours = parseFloat((shift.duration || "").replace(/[^0-9.]/g, "")) || 0;
+  return new Date(start.getTime() + hours * 60 * 60 * 1000);
+}
+
+function isShiftWindowPassed(shift) {
+  const end = getShiftEndTime(shift);
+  if (!end) return false;
+  return new Date() > end;
+}
+
 async function validateQrCredentials(shiftId, workerId, token) {
   const shift = await getShiftById(shiftId);
   if (!shift) return { ok: false, status: 404, message: "Shift not found." };
   if (shift.worker_id !== workerId) return { ok: false, status: 403, message: "Worker does not match this shift." };
   if (!shift.qr_token || shift.qr_token !== token) return { ok: false, status: 403, message: "Invalid or expired QR token." };
+  if (isShiftWindowPassed(shift)) return { ok: false, status: 400, message: "This shift has already ended. Check-in is no longer available." };
   return { ok: true, shift };
 }
 
@@ -738,6 +753,10 @@ app.post("/shift/arrive", async (req, res) => {
   }
 
   const { shift } = validation;
+
+  if (isShiftWindowPassed(shift)) {
+    return res.status(400).json({ success: false, message: "This shift has already ended. Check-in is no longer available." });
+  }
 
   if (facilityEmail && shift.contact_email !== facilityEmail) {
     return res.status(403).json({ success: false, message: "This shift does not belong to your facility." });
