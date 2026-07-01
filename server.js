@@ -799,11 +799,15 @@ app.post("/shift/arrive", async (req, res) => {
   const lateMinutes = calcLateMinutes(shift, arrivalTime);
   const durationHours = getShiftDurationHours(shift);
   const adjustedPay = lateMinutes > 0 ? calcAdjustedPay(shift.total_pay, durationHours, lateMinutes) : shift.total_pay;
+  const facilityCredit = lateMinutes > 0
+    ? Math.round((parsePayAmount(shift.total_pay) - parsePayAmount(adjustedPay)) * 100) / 100
+    : 0;
 
   const updateFields = {
     arrival_time: arrivalTime.toISOString(),
     status: "in_progress",
-    late_minutes: lateMinutes
+    late_minutes: lateMinutes,
+    facility_credit: facilityCredit
   };
   if (lateMinutes > 0) updateFields.adjusted_pay = adjustedPay;
 
@@ -835,6 +839,7 @@ app.post("/shift/arrive", async (req, res) => {
     arrival_time: arrivalTime.toISOString(),
     late_minutes: lateMinutes,
     adjusted_pay: adjustedPay,
+    facility_credit: facilityCredit,
     worker,
     shift: data
   });
@@ -903,11 +908,13 @@ app.post("/shift/complete", async (req, res) => {
     }
   }
 
+  const isWaived = shift.waived || false;
   const completeFields = {
     completion_time: completionTime.toISOString(),
     status: "completed",
     actual_hours: Math.round(actualMinutes / 6) / 10,
-    made_up: madeUp
+    made_up: madeUp || isWaived,
+    facility_credit: (madeUp || isWaived) ? 0 : (shift.facility_credit || 0)
   };
   if (finalPay) completeFields.adjusted_pay = finalPay;
 
@@ -949,8 +956,11 @@ app.post("/shift/complete", async (req, res) => {
   let completeMsg = "";
   if (madeUp) {
     completeMsg = `You stayed late and made up for the late arrival — full pay of ${finalPay} retained.`;
+  } else if (isWaived) {
+    completeMsg = `Shift completed. Facility waived the late arrival — full pay of ${finalPay} retained.`;
   } else if (shift.late_minutes > 0) {
-    completeMsg = `Shift completed. Pay adjusted to ${finalPay} due to ${shift.late_minutes} min late arrival.`;
+    const credit = shift.facility_credit || 0;
+    completeMsg = `Shift completed. Pay adjusted to ${finalPay} due to ${shift.late_minutes} min late arrival. Facility saved GHS ${credit}.`;
   } else {
     completeMsg = payout ? "Shift completed. Payout sent to worker's Mobile Money." : "Shift completed but payout failed — support will follow up.";
   }
@@ -963,10 +973,53 @@ app.post("/shift/complete", async (req, res) => {
     late_minutes: shift.late_minutes || 0,
     made_up: madeUp,
     adjusted_pay: finalPay,
+    facility_credit: (madeUp || isWaived) ? 0 : (shift.facility_credit || 0),
     actual_hours: Math.round(actualMinutes / 6) / 10,
     payout: payout ? { amount: payout.amount, transfer_code: payout.transfer_code } : null,
     shift: data
   });
+});
+
+app.post("/shifts/waive-deduction", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
+
+  const shiftId = sanitize(req.body.shift_id);
+  if (!shiftId) {
+    return res.status(400).json({ success: false, message: "shift_id is required." });
+  }
+
+  const shift = await getShiftById(shiftId);
+  if (!shift) {
+    return res.status(404).json({ success: false, message: "Shift not found." });
+  }
+
+  if (shift.contact_email !== user.email) {
+    return res.status(403).json({ success: false, message: "This shift does not belong to your facility." });
+  }
+
+  if (!shift.late_minutes || shift.late_minutes <= 0) {
+    return res.status(400).json({ success: false, message: "This shift had no late deduction to waive." });
+  }
+
+  const { error } = await supabase
+    .from("shifts")
+    .update({
+      adjusted_pay: shift.total_pay,
+      facility_credit: 0,
+      waived: true
+    })
+    .eq("id", shiftId)
+    .eq("contact_email", user.email);
+
+  if (error) {
+    log("error", "Waive deduction error", { error: error.message, shiftId });
+    return res.status(500).json({ success: false, message: "Failed to waive deduction." });
+  }
+
+  log("info", "Deduction waived", { shiftId, facility: user.email });
+  return res.json({ success: true, message: "Deduction waived. Worker will receive full pay." });
 });
 
 app.post("/applications/apply", async (req, res) => {
