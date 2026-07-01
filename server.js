@@ -365,7 +365,7 @@ app.post("/client", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { full_name, phone, city, country } = req.body;
+  const { full_name, phone, city, country, gender } = req.body;
   const email = user.email.toLowerCase();
 
   if (!full_name || !phone || !city) {
@@ -384,6 +384,7 @@ app.post("/client", async (req, res) => {
     phone: sanitize(phone),
     city: sanitize(city),
     country: country ? sanitize(country) : null,
+    gender: gender ? sanitize(gender) : null,
     user_id: user.id
   }]);
 
@@ -3920,7 +3921,7 @@ app.get("/client", async (req, res) => {
 app.put("/client", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
-  const { full_name, phone, city, country, address, gps_code } = req.body;
+  const { full_name, phone, city, country, address, gps_code, gender, profile_photo_url } = req.body;
   if (!full_name || !phone || !city) {
     return res.status(400).json({ success: false, message: "Name, phone, and city are required." });
   }
@@ -3932,6 +3933,8 @@ app.put("/client", async (req, res) => {
     if (country) updates.country = sanitize(country);
     if (address !== undefined) updates.address = sanitize(address);
     if (gps_code !== undefined) updates.gps_code = sanitize(gps_code);
+    if (gender) updates.gender = sanitize(gender);
+    if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
     const { error } = await supabase.from("clients").update(updates).eq("id", existing.id);
     if (error) return res.status(500).json({ success: false, message: "Failed to update profile." });
     return res.json({ success: true, message: "Profile updated successfully." });
@@ -4018,6 +4021,97 @@ app.get("/finance/client/transactions", async (req, res) => {
   } catch (err) {
     log("error", "Client finance transactions error", { error: err.message });
     return res.status(500).json({ success: false, message: "Failed to load transactions." });
+  }
+});
+
+// ── Client finance profile (momo / bank / card) ──
+app.get("/finance/client/profile", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: client } = await supabase
+      .from("clients")
+      .select("id, full_name, phone, bank_name, bank_account_number, bank_account_name, momo_provider, momo_number, card_last4, card_brand")
+      .eq("email", user.email)
+      .maybeSingle();
+    if (!client) return res.status(404).json({ success: false, message: "Client not found." });
+    return res.json({ success: true, data: client });
+  } catch (err) {
+    log("error", "Client finance profile error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load finance profile." });
+  }
+});
+
+app.post("/finance/client/profile", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { bank_name, bank_account_number, bank_account_name, momo_provider, momo_number } = req.body;
+    const { data: client } = await supabase.from("clients").select("id").eq("email", user.email).maybeSingle();
+    if (!client) return res.status(404).json({ success: false, message: "Client not found." });
+    const updates = {};
+    if (bank_name !== undefined) updates.bank_name = sanitize(bank_name);
+    if (bank_account_number !== undefined) updates.bank_account_number = sanitize(bank_account_number);
+    if (bank_account_name !== undefined) updates.bank_account_name = sanitize(bank_account_name);
+    if (momo_provider !== undefined) updates.momo_provider = sanitize(momo_provider);
+    if (momo_number !== undefined) updates.momo_number = sanitize(momo_number);
+    const { error } = await supabase.from("clients").update(updates).eq("id", client.id);
+    if (error) return res.status(500).json({ success: false, message: "Failed to save payment profile." });
+    return res.json({ success: true, message: "Payment profile saved." });
+  } catch (err) {
+    log("error", "Client finance profile save error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to save payment profile." });
+  }
+});
+
+// ── Workers hired by this client ──
+app.get("/client/workers-history", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const email = user.email.toLowerCase();
+    const { data: shifts } = await supabase
+      .from("shifts")
+      .select("id, role_needed, shift_date, status, total_pay, created_at")
+      .eq("contact_email", email)
+      .in("status", ["accepted", "completed", "in_progress"])
+      .order("created_at", { ascending: false });
+    const history = [];
+    for (const shift of shifts || []) {
+      const { data: app } = await supabase
+        .from("applications")
+        .select("worker_id")
+        .eq("shift_id", shift.id)
+        .eq("status", "accepted")
+        .maybeSingle();
+      if (!app) continue;
+      const { data: worker } = await supabase
+        .from("workers")
+        .select("id, full_name, role, phone, email, profile_photo_url, city, experience")
+        .eq("id", app.worker_id)
+        .maybeSingle();
+      if (!worker) continue;
+      history.push({
+        shift_id: shift.id,
+        role_needed: shift.role_needed,
+        shift_date: shift.shift_date,
+        shift_status: shift.status,
+        total_pay: parseFloat(shift.total_pay) || 0,
+        shift_created: shift.created_at,
+        worker_id: worker.id,
+        worker_name: worker.full_name,
+        worker_role: worker.role,
+        worker_phone: worker.phone,
+        worker_email: worker.email,
+        worker_photo: worker.profile_photo_url,
+        worker_city: worker.city,
+        worker_experience: worker.experience
+      });
+    }
+    return res.json({ success: true, data: history });
+  } catch (err) {
+    log("error", "Client workers history error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load workers history." });
   }
 });
 
