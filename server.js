@@ -1529,6 +1529,111 @@ app.get("/admin/trusted-facilities", async (req, res) => {
   return res.json({ success: true, data: result });
 });
 
+// ── Admin: finance summary ──
+app.get("/finance/admin/summary", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { data: shifts } = await supabase.from("shifts").select("total_pay, payment_status, facility_credit, contact_email, created_at");
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    let total_revenue = 0, pending_postpaid = 0, total_credits = 0, this_month_revenue = 0;
+    const facilitySet = new Set();
+    for (const s of shifts || []) {
+      const facilityTotal = Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100;
+      if (s.payment_status === "paid") {
+        total_revenue += facilityTotal;
+        if (s.created_at && s.created_at >= monthStart) {
+          this_month_revenue += facilityTotal;
+        }
+      }
+      if (s.payment_status === "postpaid") {
+        pending_postpaid += facilityTotal;
+      }
+      if (s.facility_credit) {
+        total_credits += parseFloat(s.facility_credit) || 0;
+      }
+      if (s.contact_email) facilitySet.add(s.contact_email);
+    }
+    return res.json({
+      success: true,
+      data: {
+        total_revenue: Math.round(total_revenue * 100) / 100,
+        pending_postpaid: Math.round(pending_postpaid * 100) / 100,
+        total_credits: Math.round(total_credits * 100) / 100,
+        total_shifts: (shifts || []).length,
+        total_facilities: facilitySet.size,
+        this_month_revenue: Math.round(this_month_revenue * 100) / 100
+      }
+    });
+  } catch (err) {
+    log("error", "Admin finance summary error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load finance summary." });
+  }
+});
+
+// ── Admin: finance transactions ──
+app.get("/finance/admin/transactions", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const { count, error: countError } = await supabase.from("shifts").select("*", { count: "exact", head: true });
+    if (countError) return res.status(500).json({ success: false, message: "Failed to count transactions." });
+    const { data: shifts, error } = await supabase.from("shifts").select("*").order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+    if (error) return res.status(500).json({ success: false, message: "Failed to load transactions." });
+    const transactions = (shifts || []).map(s => ({
+      id: s.id,
+      facility_name: s.facility_name,
+      contact_email: s.contact_email,
+      role_needed: s.role_needed,
+      shift_date: s.shift_date,
+      total_pay: parsePayAmount(s.total_pay),
+      facility_total: Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100,
+      payment_status: s.payment_status,
+      facility_credit: s.facility_credit,
+      waived: s.waived,
+      paid_at: s.paid_at,
+      created_at: s.created_at
+    }));
+    return res.json({
+      success: true,
+      data: {
+        transactions,
+        total: count,
+        page,
+        limit,
+        total_pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (err) {
+    log("error", "Admin finance transactions error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load transactions." });
+  }
+});
+
+// ── Admin: mark postpaid as paid ──
+app.post("/finance/admin/mark-paid", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { shift_id } = req.body;
+    if (!shift_id) return res.status(400).json({ success: false, message: "shift_id is required." });
+    const { error } = await supabase.from("shifts").update({ payment_status: "paid", paid_at: new Date().toISOString() }).eq("id", shift_id);
+    if (error) return res.status(500).json({ success: false, message: "Failed to update shift." });
+    log("info", "Shift marked as paid by admin", { shift_id });
+    return res.json({ success: true, message: "Shift marked as paid." });
+  } catch (err) {
+    log("error", "Admin mark paid error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to mark shift as paid." });
+  }
+});
+
 app.post("/api/upload", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
@@ -2067,6 +2172,105 @@ app.get("/payroll/payslip/:shift_id", async (req, res) => {
   } catch (err) {
     log("error", "Payslip error", { error: err.message });
     return res.status(500).json({ success: false, message: "Failed to generate payslip." });
+  }
+});
+
+// ── Finance / facility summary ──
+app.get("/finance/facility/summary", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: shifts } = await supabase.from("shifts").select("total_pay, payment_status, facility_credit, created_at").eq("contact_email", user.email.toLowerCase());
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    let total_spent = 0, this_month = 0, pending_postpaid = 0, credits_saved = 0;
+    for (const s of shifts || []) {
+      const totalPay = parsePayAmount(s.total_pay);
+      const facilityTotal = Math.round(totalPay * 1.25 * 100) / 100;
+      if (s.payment_status === "paid" || s.payment_status === "postpaid") {
+        total_spent += facilityTotal;
+        if (s.created_at && s.created_at >= monthStart) {
+          this_month += facilityTotal;
+        }
+      }
+      if (s.payment_status === "postpaid") {
+        pending_postpaid += facilityTotal;
+      }
+      if (s.facility_credit) {
+        credits_saved += parseFloat(s.facility_credit) || 0;
+      }
+    }
+    return res.json({
+      success: true,
+      data: {
+        total_spent: Math.round(total_spent * 100) / 100,
+        this_month: Math.round(this_month * 100) / 100,
+        pending_postpaid: Math.round(pending_postpaid * 100) / 100,
+        credits_saved: Math.round(credits_saved * 100) / 100
+      }
+    });
+  } catch (err) {
+    log("error", "Facility finance summary error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load finance summary." });
+  }
+});
+
+// ── Finance / facility transactions ──
+app.get("/finance/facility/transactions", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const email = user.email.toLowerCase();
+    const { count, error: countError } = await supabase.from("shifts").select("*", { count: "exact", head: true }).eq("contact_email", email);
+    if (countError) return res.status(500).json({ success: false, message: "Failed to count transactions." });
+    const { data: shifts, error } = await supabase.from("shifts").select("*").eq("contact_email", email).order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+    if (error) return res.status(500).json({ success: false, message: "Failed to load transactions." });
+    const transactions = await Promise.all((shifts || []).map(async (s) => {
+      let workerName = null, workerEmail = null;
+      const { data: app } = await supabase.from("applications").select("worker_id").eq("shift_id", s.id).eq("status", "accepted").maybeSingle();
+      if (app) {
+        const { data: worker } = await supabase.from("workers").select("full_name, email").eq("id", app.worker_id).maybeSingle();
+        if (worker) {
+          workerName = worker.full_name;
+          workerEmail = worker.email;
+        }
+      }
+      return {
+        id: s.id,
+        role_needed: s.role_needed,
+        shift_date: s.shift_date,
+        start_time: s.start_time,
+        duration_hours: s.duration_hours,
+        days_needed: s.days_needed,
+        workers_needed: s.workers_needed,
+        pay_rate: s.pay_rate,
+        total_pay: parsePayAmount(s.total_pay),
+        facility_total: Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100,
+        payment_status: s.payment_status,
+        facility_credit: s.facility_credit,
+        waived: s.waived,
+        paid_at: s.paid_at,
+        created_at: s.created_at,
+        worker_name: workerName,
+        worker_email: workerEmail
+      };
+    }));
+    return res.json({
+      success: true,
+      data: {
+        transactions,
+        total: count,
+        page,
+        limit,
+        total_pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (err) {
+    log("error", "Facility finance transactions error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load transactions." });
   }
 });
 
@@ -3126,6 +3330,92 @@ app.post("/shift/instant-pay", async (req, res) => {
   } catch (err) {
     log("error", "Instant payout error", { error: err.message });
     return res.status(500).json({ success: false, message: "Failed to process instant payout." });
+  }
+});
+
+// ── Settings / facility ──
+app.get("/settings/facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: facility, error } = await supabase.from("facilities").select("id, facility_name, facility_type, city, contact_name, contact_phone, staff_needs, billing_model, trusted_by, created_at, updated_at").eq("email", user.email.toLowerCase()).maybeSingle();
+    if (error || !facility) return res.status(404).json({ success: false, message: "Facility not found." });
+    return res.json({ success: true, data: facility });
+  } catch (err) {
+    log("error", "Settings facility error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load facility settings." });
+  }
+});
+
+app.put("/settings/facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { facility_name, facility_type, city, contact_name, contact_phone, staff_needs } = req.body;
+    const updates = {};
+    if (facility_name) updates.facility_name = sanitize(facility_name);
+    if (facility_type) updates.facility_type = sanitize(facility_type);
+    if (city) updates.city = sanitize(city);
+    if (contact_name) updates.contact_name = sanitize(contact_name);
+    if (contact_phone) updates.contact_phone = sanitize(contact_phone);
+    if (staff_needs) updates.staff_needs = sanitize(staff_needs);
+    const { data: facility, error } = await supabase.from("facilities").update(updates).eq("email", user.email.toLowerCase()).select().single();
+    if (error) return res.status(500).json({ success: false, message: "Failed to update facility." });
+    return res.json({ success: true, data: facility });
+  } catch (err) {
+    log("error", "Settings facility update error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to update facility." });
+  }
+});
+
+// ── Settings / admin ──
+app.get("/settings/admin", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { data: rows, error } = await supabase.from("platform_settings").select("*");
+    if (error || !rows || rows.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          covercare_fee_percent: 25,
+          min_pay_rate: 20,
+          suggested_rates: { pharmacist: 80, "pharmacy-tech": 40, "medical-doctor": 120, nurse: 60, "lab-technician": 50 }
+        }
+      });
+    }
+    const settings = {};
+    for (const row of rows) {
+      settings[row.key] = row.value;
+    }
+    return res.json({ success: true, data: settings });
+  } catch (err) {
+    return res.json({
+      success: true,
+      data: {
+        covercare_fee_percent: 25,
+        min_pay_rate: 20,
+        suggested_rates: { pharmacist: 80, "pharmacy-tech": 40, "medical-doctor": 120, nurse: 60, "lab-technician": 50 }
+      }
+    });
+  }
+});
+
+app.put("/settings/admin", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { key, value } = req.body;
+    if (!key) return res.status(400).json({ success: false, message: "key is required." });
+    const { error } = await supabase.from("platform_settings").upsert({ key, value }, { onConflict: "key" });
+    if (error) return res.status(500).json({ success: false, message: "Failed to save setting." });
+    log("info", "Admin setting updated", { key, value });
+    return res.json({ success: true, message: "Setting saved." });
+  } catch (err) {
+    log("error", "Settings admin update error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to save setting." });
   }
 });
 
