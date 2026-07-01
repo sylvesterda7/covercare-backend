@@ -2704,6 +2704,172 @@ app.get("/finance/facility/transactions", async (req, res) => {
   }
 });
 
+// ── Invoice generation ──
+app.post("/admin/invoices/generate", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const now = new Date();
+    const targetMonth = req.body.month || (now.getMonth() === 0 ? 12 : now.getMonth());
+    const targetYear = req.body.month === 1 && now.getMonth() === 0 ? now.getFullYear() - 1 : (req.body.year || now.getFullYear());
+    const periodStart = new Date(targetYear, targetMonth - 1, 1);
+    const periodEnd = new Date(targetYear, targetMonth, 0, 23, 59, 59);
+    const dueDate = new Date(targetYear, targetMonth, 15);
+
+    const { data: facilities } = await supabase
+      .from("facilities")
+      .select("id, email, facility_name")
+      .eq("billing_model", "postpaid");
+
+    if (!facilities || facilities.length === 0) {
+      return res.json({ success: true, message: "No postpaid facilities found.", invoices: [] });
+    }
+
+    const invoices = [];
+    for (const f of facilities) {
+      const { data: shifts } = await supabase
+        .from("shifts")
+        .select("total_pay, payment_status")
+        .eq("contact_email", f.email)
+        .eq("payment_status", "postpaid")
+        .gte("created_at", periodStart.toISOString())
+        .lte("created_at", periodEnd.toISOString());
+
+      if (!shifts || shifts.length === 0) continue;
+
+      const totalAmount = shifts.reduce((sum, s) => sum + (parsePayAmount(s.total_pay) * 1.25), 0);
+
+      const { data: existing } = await supabase
+        .from("invoices")
+        .select("id")
+        .eq("facility_id", f.id)
+        .eq("month", targetMonth)
+        .eq("year", targetYear)
+        .maybeSingle();
+
+      if (existing) {
+        await supabase.from("invoices").update({
+          total_amount: Math.round(totalAmount * 100) / 100,
+          shift_count: shifts.length,
+          status: "pending",
+          notes: "Regenerated"
+        }).eq("id", existing.id);
+        invoices.push({ id: existing.id, facility: f.facility_name, amount: Math.round(totalAmount * 100) / 100, shifts: shifts.length });
+      } else {
+        const { data: ins } = await supabase.from("invoices").insert({
+          facility_id: f.id,
+          facility_email: f.email,
+          facility_name: f.facility_name,
+          month: targetMonth,
+          year: targetYear,
+          total_amount: Math.round(totalAmount * 100) / 100,
+          shift_count: shifts.length,
+          period_start: periodStart.toISOString().split("T")[0],
+          period_end: periodEnd.toISOString().split("T")[0],
+          due_date: dueDate.toISOString().split("T")[0]
+        }).select().single();
+        if (ins) invoices.push({ id: ins.id, facility: f.facility_name, amount: ins.total_amount, shifts: ins.shift_count });
+      }
+
+      await supabase.from("notifications").insert({
+        user_email: f.email,
+        title: "Invoice ready",
+        message: `Your invoice for ${periodStart.toLocaleString("default", { month: "long" })} ${targetYear} (GHS ${Math.round(totalAmount * 100) / 100}) is ready. Due: ${dueDate.toISOString().split("T")[0]}.`,
+        type: "info"
+      });
+    }
+
+    log("info", "Invoices generated", { month: targetMonth, year: targetYear, count: invoices.length });
+    return res.json({ success: true, message: `${invoices.length} invoice(s) generated.`, invoices });
+  } catch (err) {
+    log("error", "Invoice generation error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to generate invoices." });
+  }
+});
+
+// ── Facility: list invoices ──
+app.get("/finance/facility/invoices", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: invoices } = await supabase
+      .from("invoices")
+      .select("*")
+      .eq("facility_email", user.email.toLowerCase())
+      .order("year", { ascending: false })
+      .order("month", { ascending: false });
+
+    return res.json({ success: true, data: invoices || [] });
+  } catch (err) {
+    log("error", "Facility invoices error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load invoices." });
+  }
+});
+
+// ── Admin: list all invoices ──
+app.get("/finance/admin/invoices", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { data: invoices } = await supabase
+      .from("invoices")
+      .select("*")
+      .order("year", { ascending: false })
+      .order("month", { ascending: false });
+
+    return res.json({ success: true, data: invoices || [] });
+  } catch (err) {
+    log("error", "Admin invoices error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load invoices." });
+  }
+});
+
+// ── Admin: mark invoice as paid ──
+app.post("/finance/admin/invoice/:id/pay", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const invoiceId = parseInt(req.params.id);
+    if (isNaN(invoiceId)) return res.status(400).json({ success: false, message: "Invalid invoice ID." });
+
+    const { data: invoice, error: fetchError } = await supabase
+      .from("invoices")
+      .select("*")
+      .eq("id", invoiceId)
+      .maybeSingle();
+
+    if (fetchError || !invoice) return res.status(404).json({ success: false, message: "Invoice not found." });
+    if (invoice.status === "paid") return res.json({ success: true, message: "Invoice already marked as paid." });
+
+    const { error: updateError } = await supabase
+      .from("invoices")
+      .update({
+        status: "paid",
+        paid_at: new Date().toISOString(),
+        paid_by: user.email
+      })
+      .eq("id", invoiceId);
+
+    if (updateError) throw updateError;
+
+    await supabase.from("notifications").insert({
+      user_email: invoice.facility_email,
+      title: "Invoice paid",
+      message: `Your invoice for ${invoice.month}/${invoice.year} (GHS ${invoice.total_amount}) has been marked as paid.`,
+      type: "success"
+    });
+
+    log("info", "Invoice marked paid", { invoice_id: invoiceId, admin: user.email });
+    return res.json({ success: true, message: "Invoice marked as paid." });
+  } catch (err) {
+    log("error", "Invoice pay error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to mark invoice as paid." });
+  }
+});
+
 // ── Finance / payout profile ──
 app.get("/finance/worker/profile", async (req, res) => {
   const user = await requireAuth(req, res);
