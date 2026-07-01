@@ -521,6 +521,39 @@ app.post("/payment/initialize", async (req, res) => {
     return res.status(400).json({ success: false, message: "Payment amount does not match shift total." });
   }
 
+  // ── Check if facility is trusted (postpaid billing) ──
+  const { data: facility } = await supabase
+    .from("facilities")
+    .select("billing_model, trusted_by")
+    .eq("email", email)
+    .maybeSingle();
+
+  const isTrusted = facility?.billing_model === "postpaid" && facility?.trusted_by;
+
+  if (isTrusted) {
+    // Trusted facility — skip Paystack, create shift directly
+    const shiftFields = pickShiftFields(shift_data);
+    shiftFields.contact_email = user.email;
+    shiftFields.payment_status = "postpaid";
+    shiftFields.status = "open";
+    const { workerTotal, facilityTotal: ft } = computeShiftAmounts(shiftFields);
+    shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+
+    const { error: insertError } = await supabase.from("shifts").insert([shiftFields]);
+    if (insertError) {
+      log("error", "Trusted facility shift insert error", { error: insertError.message, email });
+      return res.status(500).json({ success: false, message: "Failed to create shift." });
+    }
+
+    log("info", "Shift posted (postpaid)", { email, facilityTotal: ft });
+    return res.json({
+      success: true,
+      message: "Shift posted successfully. Your account will be billed at end of month.",
+      postpaid: true,
+      facility_total: ft
+    });
+  }
+
   try {
     const response = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
@@ -1384,6 +1417,112 @@ app.post("/admin/toggle-license", async (req, res) => {
 
   log("info", "License toggled", { worker_id, new_status: !current_status });
   return res.json({ success: true, message: "Worker updated." });
+});
+
+// ── Admin: approve facility for postpaid billing ──
+app.post("/admin/approve-facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const email = sanitize(req.body.email);
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Facility email is required." });
+  }
+
+  const { data: facility, error: fetchError } = await supabase
+    .from("facilities")
+    .select("id, billing_model")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (fetchError || !facility) {
+    return res.status(404).json({ success: false, message: "Facility not found." });
+  }
+
+  if (facility.billing_model === "postpaid") {
+    return res.json({ success: true, message: "Facility is already approved for postpaid billing." });
+  }
+
+  const { error } = await supabase
+    .from("facilities")
+    .update({ billing_model: "postpaid", trusted_by: user.email })
+    .eq("email", email);
+
+  if (error) {
+    log("error", "Approve facility error", { error: error.message, email });
+    return res.status(500).json({ success: false, message: "Failed to approve facility." });
+  }
+
+  log("info", "Facility approved for postpaid", { email, approved_by: user.email });
+  return res.json({ success: true, message: "Facility approved for postpaid billing." });
+});
+
+// ── Admin: revoke postpaid billing ──
+app.post("/admin/revoke-facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const email = sanitize(req.body.email);
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Facility email is required." });
+  }
+
+  const { error } = await supabase
+    .from("facilities")
+    .update({ billing_model: "prepaid", trusted_by: null })
+    .eq("email", email);
+
+  if (error) {
+    log("error", "Revoke facility error", { error: error.message, email });
+    return res.status(500).json({ success: false, message: "Failed to revoke facility." });
+  }
+
+  log("info", "Facility postpaid revoked", { email });
+  return res.json({ success: true, message: "Facility postpaid billing revoked." });
+});
+
+// ── Admin: list trusted facilities with monthly totals ──
+app.get("/admin/trusted-facilities", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { data: facilities, error: facError } = await supabase
+    .from("facilities")
+    .select("id, facility_name, email, city, billing_model, trusted_by, created_at")
+    .eq("billing_model", "postpaid")
+    .order("created_at", { ascending: false });
+
+  if (facError) {
+    return res.status(500).json({ success: false, message: "Failed to load facilities." });
+  }
+
+  // Get monthly totals for each facility
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+  const result = await Promise.all((facilities || []).map(async (fac) => {
+    const { data: shifts } = await supabase
+      .from("shifts")
+      .select("total_pay, created_at")
+      .eq("contact_email", fac.email)
+      .eq("payment_status", "postpaid")
+      .gte("created_at", monthStart);
+
+    const monthlyTotal = (shifts || []).reduce((sum, s) => {
+      return sum + (parseFloat((s.total_pay || "").replace(/[^0-9.]/g, "")) || 0) * 1.25;
+    }, 0);
+
+    return {
+      ...fac,
+      monthly_charge: Math.round(monthlyTotal * 100) / 100,
+      shift_count: (shifts || []).length
+    };
+  }));
+
+  return res.json({ success: true, data: result });
 });
 
 app.post("/api/upload", async (req, res) => {
