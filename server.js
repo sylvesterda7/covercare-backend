@@ -125,6 +125,7 @@ const SHIFT_FIELDS = [
   "facility_name", "facility_type", "city", "contact_name",
   "contact_email", "contact_phone", "role_needed", "shift_date",
   "start_time", "duration", "pay_rate", "total_pay",
+  "duration_hours", "days_needed", "workers_needed",
   "experience_required", "urgency", "notes"
 ];
 
@@ -140,11 +141,14 @@ function pickShiftFields(data) {
 }
 
 function computeShiftAmounts(shiftData) {
-  const hours = parseFloat(String(shiftData.duration || "").replace(/[^0-9.]/g, "")) || 0;
+  const perDayHours = parseFloat(shiftData.duration_hours) || parseFloat(String(shiftData.duration || "").replace(/[^0-9.]/g, "")) || 0;
+  const days = parseInt(shiftData.days_needed) || 1;
+  const workers = parseInt(shiftData.workers_needed) || 1;
+  const totalHours = perDayHours * days * workers;
   const rate = parseFloat(String(shiftData.pay_rate || "").replace(/[^0-9.]/g, "")) || 0;
-  const workerTotal = Math.round(rate * hours * 100) / 100;
+  const workerTotal = Math.round(rate * totalHours * 100) / 100;
   const facilityTotal = Math.round(workerTotal * 1.25 * 100) / 100;
-  return { hours, rate, workerTotal, facilityTotal };
+  return { hours: totalHours, rate, workerTotal, facilityTotal, perDayHours, days, workers };
 }
 
 function isPharmacyRole(role) {
@@ -172,6 +176,7 @@ function getShiftStartTime(shift) {
 }
 
 function getShiftDurationHours(shift) {
+  if (shift.duration_hours) return parseFloat(shift.duration_hours) || 0;
   return parseFloat((shift.duration || "").replace(/[^0-9.]/g, "")) || 0;
 }
 
