@@ -521,17 +521,21 @@ app.post("/payment/initialize", async (req, res) => {
     return res.status(400).json({ success: false, message: "Payment amount does not match shift total." });
   }
 
-  // ── Check if facility is trusted (postpaid billing) ──
-  const { data: facility } = await supabase
-    .from("facilities")
-    .select("billing_model, trusted_by")
-    .eq("email", email)
-    .maybeSingle();
+  // ── Check if facility is trusted and chose postpaid ──
+  const wantsPostpaid = req.body.payment_method === "postpaid";
 
-  const isTrusted = facility?.billing_model === "postpaid" && facility?.trusted_by;
+  let isTrusted = false;
+  if (wantsPostpaid) {
+    const { data: facility } = await supabase
+      .from("facilities")
+      .select("billing_model, trusted_by")
+      .eq("email", email)
+      .maybeSingle();
+    isTrusted = facility?.billing_model === "postpaid" && facility?.trusted_by;
+  }
 
-  if (isTrusted) {
-    // Trusted facility — skip Paystack, create shift directly
+  if (wantsPostpaid && isTrusted) {
+    // Trusted facility chose postpaid — skip Paystack, create shift directly
     const shiftFields = pickShiftFields(shift_data);
     shiftFields.contact_email = user.email;
     shiftFields.payment_status = "postpaid";
