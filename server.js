@@ -1380,6 +1380,19 @@ app.get("/admin/analytics", async (req, res) => {
     const { count: unverifiedCount } = await supabase.from("workers").select("id", { count: "exact", head: true }).eq("license_verified", false);
 
     const activeShifts = (allShifts || []).filter(s => s.status === "in_progress" || s.status === "accepted").length;
+    const paidShifts = (allShifts || []).filter(s => s.payment_status === "paid").length;
+    const totalShifts = (allShifts || []).length;
+    const filledShifts = (allShifts || []).filter(s => s.status === "completed" || s.status === "in_progress" || s.status === "accepted").length;
+    const fillRate = totalShifts > 0 ? Math.round((filledShifts / totalShifts) * 100) : 0;
+
+    const totalRevenue = paidShifts.reduce((sum, s) => {
+      return sum + (parseFloat((s.total_pay || "").replace(/[^0-9.]/g, "")) || 0) * 0.25;
+    }, 0);
+
+    const workers = allWorkers || [];
+    const facilities = allFacilities || [];
+    const totalWorkersCount = workers.length;
+    const totalFacilitiesCount = facilities.length;
 
     return res.json({
       success: true,
@@ -1392,11 +1405,57 @@ app.get("/admin/analytics", async (req, res) => {
       verifiedWorkersCount: verifiedCount || 0,
       identityVerifiedCount: identityVerifiedCount || 0,
       unverifiedCount: unverifiedCount || 0,
-      activeShifts
+      activeShifts,
+      paidShifts,
+      totalShifts,
+      fillRate,
+      totalRevenue,
+      totalWorkers: totalWorkersCount,
+      totalFacilities: totalFacilitiesCount
     });
   } catch (err) {
     log("error", "Admin analytics error", { error: err.message });
     return res.status(500).json({ success: false, message: "Failed to load analytics." });
+  }
+});
+
+// ── Admin: reset account ──
+app.post("/admin/reset-account", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { email, type } = req.body;
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Email is required." });
+  }
+
+  try {
+    if (type === "worker") {
+      const { data: worker } = await supabase.from("workers").select("id, user_id").eq("email", email.toLowerCase()).maybeSingle();
+      if (worker) {
+        await supabase.from("workers").delete().eq("id", worker.id);
+        if (worker.user_id) {
+          await supabase.auth.admin.deleteUser(worker.user_id);
+        }
+      }
+    } else if (type === "facility") {
+      const { data: facility } = await supabase.from("facilities").select("id, user_id").eq("email", email.toLowerCase()).maybeSingle();
+      if (facility) {
+        await supabase.from("facilities").delete().eq("id", facility.id);
+        if (facility.user_id) {
+          await supabase.auth.admin.deleteUser(facility.user_id);
+        }
+      }
+    } else {
+      return res.status(400).json({ success: false, message: "Invalid type. Must be 'worker' or 'facility'." });
+    }
+
+    log("info", "Account reset by admin", { email, type, admin: user.email });
+    return res.json({ success: true, message: `${type} account for ${email} has been reset.` });
+  } catch (err) {
+    log("error", "Admin reset account error", { error: err.message, email, type });
+    return res.status(500).json({ success: false, message: "Failed to reset account." });
   }
 });
 
