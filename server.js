@@ -1380,12 +1380,13 @@ app.get("/admin/analytics", async (req, res) => {
     const { count: unverifiedCount } = await supabase.from("workers").select("id", { count: "exact", head: true }).eq("license_verified", false);
 
     const activeShifts = (allShifts || []).filter(s => s.status === "in_progress" || s.status === "accepted").length;
-    const paidShifts = (allShifts || []).filter(s => s.payment_status === "paid").length;
+    const paidShiftsList = (allShifts || []).filter(s => s.payment_status === "paid");
+    const paidShifts = paidShiftsList.length;
     const totalShifts = (allShifts || []).length;
     const filledShifts = (allShifts || []).filter(s => s.status === "completed" || s.status === "in_progress" || s.status === "accepted").length;
     const fillRate = totalShifts > 0 ? Math.round((filledShifts / totalShifts) * 100) : 0;
 
-    const totalRevenue = paidShifts.reduce((sum, s) => {
+    const totalRevenue = paidShiftsList.reduce((sum, s) => {
       return sum + (parseFloat((s.total_pay || "").replace(/[^0-9.]/g, "")) || 0) * 0.25;
     }, 0);
 
