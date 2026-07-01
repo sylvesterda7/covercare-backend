@@ -1565,6 +1565,145 @@ app.get("/admin/performance", async (req, res) => {
   }
 });
 
+// ── Admin: get full worker detail ──
+app.get("/admin/worker/:id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const { data: worker, error } = await supabase
+      .from("workers")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error || !worker) {
+      return res.status(404).json({ success: false, message: "Worker not found." });
+    }
+
+    // Get shift stats
+    const { data: shifts } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("worker_id", worker.id);
+
+    const shiftStats = {
+      total: (shifts || []).length,
+      completed: (shifts || []).filter(s => s.status === "completed").length,
+      in_progress: (shifts || []).filter(s => s.status === "in_progress").length,
+      cancelled: (shifts || []).filter(s => s.status === "cancelled").length,
+      total_earnings: (shifts || []).reduce((sum, s) => sum + parsePayAmount(s.total_pay), 0)
+    };
+
+    return res.json({ success: true, worker, shiftStats });
+  } catch (err) {
+    log("error", "Admin worker detail error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load worker details." });
+  }
+});
+
+// ── Admin: get full facility detail ──
+app.get("/admin/facility/:id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const { data: facility, error } = await supabase
+      .from("facilities")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error || !facility) {
+      return res.status(404).json({ success: false, message: "Facility not found." });
+    }
+
+    // Get shift stats
+    const { data: shifts } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("contact_email", facility.email);
+
+    const shiftStats = {
+      total: (shifts || []).length,
+      completed: (shifts || []).filter(s => s.status === "completed").length,
+      in_progress: (shifts || []).filter(s => s.status === "in_progress").length,
+      open: (shifts || []).filter(s => s.status === "open").length,
+      cancelled: (shifts || []).filter(s => s.status === "cancelled").length,
+      total_spend: (shifts || []).reduce((sum, s) => sum + parsePayAmount(s.total_pay) * 1.25, 0)
+    };
+
+    return res.json({ success: true, facility, shiftStats });
+  } catch (err) {
+    log("error", "Admin facility detail error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load facility details." });
+  }
+});
+
+// ── Admin: toggle facility billing model ──
+app.post("/admin/toggle-billing", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { facility_id } = req.body;
+  if (!facility_id) {
+    return res.status(400).json({ success: false, message: "Facility ID is required." });
+  }
+
+  try {
+    const { data: facility, error: fetchError } = await supabase
+      .from("facilities")
+      .select("billing_model, trusted_by, email")
+      .eq("id", facility_id)
+      .single();
+
+    if (fetchError || !facility) {
+      return res.status(404).json({ success: false, message: "Facility not found." });
+    }
+
+    const isCurrentlyPostpaid = facility.billing_model === "postpaid";
+    const newBillingModel = isCurrentlyPostpaid ? "prepaid" : "postpaid";
+    const newTrustedBy = isCurrentlyPostpaid ? null : user.email;
+
+    const { error: updateError } = await supabase
+      .from("facilities")
+      .update({
+        billing_model: newBillingModel,
+        trusted_by: newTrustedBy
+      })
+      .eq("id", facility_id);
+
+    if (updateError) throw updateError;
+
+    // Create notification for facility
+    const notifMessage = isCurrentlyPostpaid
+      ? "Your postpaid billing has been disabled. Please pay upfront for new shifts."
+      : "Your facility has been approved for postpaid billing. You can now post shifts without upfront payment.";
+
+    await supabase.from("notifications").insert({
+      user_email: facility.email,
+      title: "Billing model updated",
+      message: notifMessage,
+      type: "info"
+    });
+
+    return res.json({
+      success: true,
+      billing_model: newBillingModel,
+      trusted_by: newTrustedBy || null,
+      message: isCurrentlyPostpaid
+        ? "Facility reverted to prepaid billing."
+        : "Facility approved for postpaid billing."
+    });
+  } catch (err) {
+    log("error", "Admin toggle billing error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to toggle billing model." });
+  }
+});
+
 // ── Admin: reset account ──
 app.post("/admin/reset-account", async (req, res) => {
   const user = await requireAuth(req, res);
