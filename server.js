@@ -2922,6 +2922,42 @@ async function resolveUserType(email) {
   return null;
 }
 
+// Route: check if email belongs to a worker (used by login.js routing)
+app.post("/worker/by-email", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.json({ success: false, message: "Email required" });
+    const { data } = await supabase.from("workers").select("id").eq("email", email).maybeSingle();
+    res.json({ success: !!data });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// Route: check if email belongs to a facility (used by login.js routing)
+app.post("/facility/by-email", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.json({ success: false, message: "Email required" });
+    const { data } = await supabase.from("facilities").select("id").eq("email", email).maybeSingle();
+    res.json({ success: !!data });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// Route: check if email belongs to a client (used by login.js routing)
+app.post("/client/by-email", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.json({ success: false, message: "Email required" });
+    const { data } = await supabase.from("clients").select("id").eq("email", email).maybeSingle();
+    res.json({ success: !!data });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
 // Helper: get wallet balance
 async function getWalletBalance(email, userType) {
   const table = walletTable(userType);
