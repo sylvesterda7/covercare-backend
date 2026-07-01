@@ -360,6 +360,41 @@ app.post("/facility", async (req, res) => {
   return res.json({ success: true, message: "Facility saved successfully." });
 });
 
+// ── Client (individual) signup ──
+app.post("/client", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const { full_name, phone, city } = req.body;
+  const email = user.email.toLowerCase();
+
+  if (!full_name || !phone || !city) {
+    return res.status(400).json({ success: false, message: "Name, phone, and city are required." });
+  }
+
+  // Check if client already exists
+  const { data: existing } = await supabase.from("clients").select("id").eq("email", email).maybeSingle();
+  if (existing) {
+    return res.status(409).json({ success: false, message: "A client account with this email already exists." });
+  }
+
+  const { error } = await supabase.from("clients").insert([{
+    full_name: sanitize(full_name),
+    email,
+    phone: sanitize(phone),
+    city: sanitize(city),
+    user_id: user.id
+  }]);
+
+  if (error) {
+    log("error", "Client save error", { error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to save client.", error: error.message });
+  }
+
+  log("info", "Client saved", { email });
+  return res.json({ success: true, message: "Account created successfully." });
+});
+
 app.post("/shift", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
@@ -1648,7 +1683,9 @@ app.post("/admin/toggle-billing", async (req, res) => {
   if (!user) return;
   if (!requireAdmin(req, res)) return;
 
-  const { facility_id } = req.body;
+  const rawId = req.body?.facility_id;
+  const facility_id = (rawId || "").toString().trim();
+  log("info", "Toggle billing request", { rawId, facility_id, bodyKeys: Object.keys(req.body || {}) });
   if (!facility_id) {
     return res.status(400).json({ success: false, message: "Facility ID is required." });
   }
@@ -1656,9 +1693,11 @@ app.post("/admin/toggle-billing", async (req, res) => {
   try {
     const { data: facility, error: fetchError } = await supabase
       .from("facilities")
-      .select("billing_model, trusted_by, email")
+      .select("id, billing_model, trusted_by, email")
       .eq("id", facility_id)
-      .single();
+      .maybeSingle();
+
+    log("info", "Toggle billing facility query result", { facility_id, found: !!facility, fetchError: fetchError?.message || null, fetchErrorCode: fetchError?.code || null });
 
     if (fetchError || !facility) {
       return res.status(404).json({ success: false, message: "Facility not found." });
