@@ -3902,6 +3902,125 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
+// ── Client settings ──
+app.get("/client", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: client, error } = await supabase.from("clients")
+      .select("*").eq("email", user.email.toLowerCase()).maybeSingle();
+    if (error || !client) return res.status(404).json({ success: false, message: "Client not found." });
+    return res.json({ success: true, data: client });
+  } catch (err) {
+    log("error", "Get client error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load profile." });
+  }
+});
+
+app.put("/client", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  const { full_name, phone, city, country, address, gps_code } = req.body;
+  if (!full_name || !phone || !city) {
+    return res.status(400).json({ success: false, message: "Name, phone, and city are required." });
+  }
+  try {
+    const { data: existing } = await supabase.from("clients")
+      .select("id").eq("email", user.email.toLowerCase()).maybeSingle();
+    if (!existing) return res.status(404).json({ success: false, message: "Client not found." });
+    const updates = { full_name: sanitize(full_name), phone: sanitize(phone), city: sanitize(city) };
+    if (country) updates.country = sanitize(country);
+    if (address !== undefined) updates.address = sanitize(address);
+    if (gps_code !== undefined) updates.gps_code = sanitize(gps_code);
+    const { error } = await supabase.from("clients").update(updates).eq("id", existing.id);
+    if (error) return res.status(500).json({ success: false, message: "Failed to update profile." });
+    return res.json({ success: true, message: "Profile updated successfully." });
+  } catch (err) {
+    log("error", "Update client error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to update profile." });
+  }
+});
+
+app.delete("/client", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  const email = req.body.email;
+  if (!email || email.toLowerCase() !== user.email.toLowerCase()) {
+    return res.status(400).json({ success: false, message: "Email must match your account." });
+  }
+  await supabase.from("clients").delete().eq("email", email);
+  const { error: authError } = await supabase.auth.admin.deleteUser(user.id);
+  if (authError) {
+    log("error", "Client auth delete error", { error: authError.message });
+    return res.status(500).json({ success: false, message: "Account data removed but auth deletion failed. Contact support." });
+  }
+  log("info", "Client account deleted", { email });
+  return res.json({ success: true, message: "Account permanently deleted." });
+});
+
+// ── Client finance ──
+app.get("/finance/client/summary", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data: shifts } = await supabase.from("shifts")
+      .select("total_pay, payment_status, created_at")
+      .eq("contact_email", user.email.toLowerCase());
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    let total_spent = 0, this_month = 0, pending = 0;
+    for (const s of shifts || []) {
+      const pay = parseFloat(s.total_pay) || 0;
+      if (s.payment_status === "paid") {
+        total_spent += pay;
+        if (s.created_at && s.created_at >= monthStart) this_month += pay;
+      }
+      if (s.payment_status === "pending" || s.payment_status === "postpaid") pending += pay;
+    }
+    return res.json({ success: true, data: {
+      total_spent: Math.round(total_spent * 100) / 100,
+      this_month: Math.round(this_month * 100) / 100,
+      pending: Math.round(pending * 100) / 100
+    }});
+  } catch (err) {
+    log("error", "Client finance summary error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load finance summary." });
+  }
+});
+
+app.get("/finance/client/transactions", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+    const email = user.email.toLowerCase();
+    const { count, error: countError } = await supabase.from("shifts")
+      .select("*", { count: "exact", head: true }).eq("contact_email", email);
+    if (countError) return res.status(500).json({ success: false, message: "Failed to count transactions." });
+    const { data: shifts, error } = await supabase.from("shifts")
+      .select("*").eq("contact_email", email).order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (error) return res.status(500).json({ success: false, message: "Failed to load transactions." });
+    const transactions = (shifts || []).map(s => ({
+      id: s.id, role_needed: s.role_needed, shift_date: s.shift_date,
+      start_time: s.start_time, duration_hours: s.duration_hours,
+      pay_rate: s.pay_rate, total_pay: parseFloat(s.total_pay) || 0,
+      payment_status: s.payment_status, payment_reference: s.payment_reference,
+      facility_type: s.facility_type, facility_name: s.facility_name,
+      created_at: s.created_at, status: s.status
+    }));
+    return res.json({ success: true, data: {
+      transactions, total: count, page, limit,
+      total_pages: Math.ceil(count / limit)
+    }});
+  } catch (err) {
+    log("error", "Client finance transactions error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load transactions." });
+  }
+});
+
 app.listen(PORT, () => {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SECRET_KEY) {
     log("warn", "Supabase env vars missing — database calls will fail");
