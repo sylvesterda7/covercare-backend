@@ -301,7 +301,7 @@ app.post("/worker", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { full_name, email, phone, role, license_number, city, experience, profile_photo_url, bio } = body;
+  const { full_name, email, phone, role, license_number, city, country, experience, profile_photo_url, bio } = body;
 
   if (!full_name || !email || !phone || !role || !city) {
     return res.status(400).json({ success: false, message: "full_name, email, phone, role, and city are required." });
@@ -312,7 +312,7 @@ app.post("/worker", async (req, res) => {
   }
 
   const insertData = {
-    full_name, email, phone, role, license_number, license_verified: false, city, experience, bio
+    full_name, email, phone, role, license_number, license_verified: false, city, country, experience, bio
   };
   if (profile_photo_url) insertData.profile_photo_url = profile_photo_url;
 
@@ -336,14 +336,14 @@ app.post("/facility", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { facility_name, facility_type, city, contact_name, contact_role, email, phone, staff_needs, frequency, incorporation_doc_url, hefra_license_url, pharmacy_council_url } = body;
+  const { facility_name, facility_type, city, country, contact_name, contact_role, email, phone, staff_needs, frequency, incorporation_doc_url, hefra_license_url, pharmacy_council_url } = body;
 
   if (user.email.toLowerCase() !== email.toLowerCase()) {
     return res.status(403).json({ success: false, message: "Email does not match your authenticated account." });
   }
 
   const insertData = {
-    facility_name, facility_type, city, contact_name, contact_role, email, phone, staff_needs, frequency
+    facility_name, facility_type, city, country, contact_name, contact_role, email, phone, staff_needs, frequency
   };
   if (incorporation_doc_url) insertData.incorporation_doc_url = incorporation_doc_url;
   if (hefra_license_url) insertData.hefra_license_url = hefra_license_url;
@@ -365,7 +365,7 @@ app.post("/client", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { full_name, phone, city } = req.body;
+  const { full_name, phone, city, country } = req.body;
   const email = user.email.toLowerCase();
 
   if (!full_name || !phone || !city) {
@@ -383,6 +383,7 @@ app.post("/client", async (req, res) => {
     email,
     phone: sanitize(phone),
     city: sanitize(city),
+    country: country ? sanitize(country) : null,
     user_id: user.id
   }]);
 
@@ -2103,7 +2104,7 @@ app.put("/worker", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { full_name, phone, role, license_number, city, experience, profile_photo_url, bio } = req.body;
+  const { full_name, phone, role, license_number, city, country, experience, profile_photo_url, bio } = req.body;
 
   const { data: existing } = await supabase
     .from("workers")
@@ -2121,6 +2122,7 @@ app.put("/worker", async (req, res) => {
   if (role) updates.role = sanitize(role);
   if (license_number) updates.license_number = sanitize(license_number);
   if (city) updates.city = sanitize(city);
+  if (country) updates.country = sanitize(country);
   if (experience) updates.experience = sanitize(experience);
   if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
   if (bio !== undefined) updates.bio = sanitize(bio);
@@ -2140,7 +2142,7 @@ app.put("/facility", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { facility_name, facility_type, city, contact_name, contact_role, phone, staff_needs, frequency, incorporation_doc_url, hefra_license_url, pharmacy_council_url } = req.body;
+  const { facility_name, facility_type, city, country, contact_name, contact_role, phone, staff_needs, frequency, incorporation_doc_url, hefra_license_url, pharmacy_council_url } = req.body;
 
   const { data: existing } = await supabase
     .from("facilities")
@@ -2156,6 +2158,7 @@ app.put("/facility", async (req, res) => {
   if (facility_name) updates.facility_name = sanitize(facility_name);
   if (facility_type) updates.facility_type = sanitize(facility_type);
   if (city) updates.city = sanitize(city);
+  if (country) updates.country = sanitize(country);
   if (contact_name) updates.contact_name = sanitize(contact_name);
   if (contact_role) updates.contact_role = sanitize(contact_role);
   if (phone) updates.phone = sanitize(phone);
