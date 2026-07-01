@@ -4518,14 +4518,29 @@ app.put("/client", async (req, res) => {
     const { data: existing } = await supabase.from("clients")
       .select("id").eq("email", user.email.toLowerCase()).maybeSingle();
     if (!existing) return res.status(404).json({ success: false, message: "Client not found." });
+
+    // Build updates — try all fields first; if it fails, retry with only basic fields
     const updates = { full_name: sanitize(full_name), phone: sanitize(phone), city: sanitize(city) };
     if (country) updates.country = sanitize(country);
+    if (gender) updates.gender = sanitize(gender);
     if (address !== undefined) updates.address = sanitize(address);
     if (gps_code !== undefined) updates.gps_code = sanitize(gps_code);
-    if (gender) updates.gender = sanitize(gender);
     if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
-    const { error } = await supabase.from("clients").update(updates).eq("id", existing.id);
-    if (error) return res.status(500).json({ success: false, message: "Failed to update profile." });
+
+    let { error } = await supabase.from("clients").update(updates).eq("id", existing.id);
+    // If update failed, retry with only basic fields (newer columns may not exist yet)
+    if (error) {
+      log("warn", "Full client update failed, retrying with basics", { error: error.message });
+      const basic = { full_name: sanitize(full_name), phone: sanitize(phone), city: sanitize(city) };
+      if (country) basic.country = sanitize(country);
+      if (gender) basic.gender = sanitize(gender);
+      const { error: e2 } = await supabase.from("clients").update(basic).eq("id", existing.id);
+      if (e2) {
+        log("error", "Basic client update also failed", { error: e2.message });
+        return res.status(500).json({ success: false, message: "Failed to update profile." });
+      }
+      return res.json({ success: true, message: "Profile updated (basic fields)." });
+    }
     return res.json({ success: true, message: "Profile updated successfully." });
   } catch (err) {
     log("error", "Update client error", { error: err.message });
@@ -4621,7 +4636,7 @@ app.get("/finance/client/profile", async (req, res) => {
     const { data: client } = await supabase
       .from("clients")
       .select("id, full_name, phone, bank_name, bank_account_number, bank_account_name, momo_provider, momo_number, card_last4, card_brand")
-      .eq("email", user.email)
+      .eq("email", user.email.toLowerCase())
       .maybeSingle();
     if (!client) return res.status(404).json({ success: false, message: "Client not found." });
     return res.json({ success: true, data: client });
@@ -4636,7 +4651,7 @@ app.post("/finance/client/profile", async (req, res) => {
   if (!user) return;
   try {
     const { bank_name, bank_account_number, bank_account_name, momo_provider, momo_number } = req.body;
-    const { data: client } = await supabase.from("clients").select("id").eq("email", user.email).maybeSingle();
+    const { data: client } = await supabase.from("clients").select("id").eq("email", user.email.toLowerCase()).maybeSingle();
     if (!client) return res.status(404).json({ success: false, message: "Client not found." });
     const updates = {};
     if (bank_name !== undefined) updates.bank_name = sanitize(bank_name);

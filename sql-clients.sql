@@ -1,0 +1,11 @@
+-- Add missing columns to clients table
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS gps_code TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS profile_photo_url TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS bank_name TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS bank_account_number TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS bank_account_name TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS momo_provider TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS momo_number TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS card_last4 TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS card_brand TEXT;
