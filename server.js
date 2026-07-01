@@ -595,6 +595,40 @@ app.post("/payment/initialize", async (req, res) => {
     });
   }
 
+  // ── Check wallet balance for non-postpaid users ──
+  const userType = await resolveUserType(email);
+  if (userType) {
+    const balance = await getWalletBalance(email, userType);
+    if (balance >= facilityTotal) {
+      // Sufficient wallet balance — deduct and create shift directly
+      await updateWallet(email, userType, "deduction", facilityTotal, null, `Shift posting: ${shift_data.role_needed || ""} ${shift_data.shift_date || ""}`);
+      const shiftFields = pickShiftFields(shift_data);
+      shiftFields.contact_email = user.email;
+      shiftFields.payment_status = "paid";
+      shiftFields.status = "open";
+      const { workerTotal, facilityTotal: ft } = computeShiftAmounts(shiftFields);
+      shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+
+      const { error: insertError } = await supabase.from("shifts").insert([shiftFields]);
+      if (insertError) {
+        // Refund wallet if shift insert fails
+        await updateWallet(email, userType, "refund", facilityTotal, null, "Refund for failed shift creation");
+        log("error", "Wallet shift insert error, refunded", { error: insertError.message, email });
+        return res.status(500).json({ success: false, message: "Shift could not be created. Amount refunded to wallet." });
+      }
+
+      log("info", "Shift posted (wallet)", { email, facilityTotal: ft });
+      return res.json({
+        success: true,
+        message: "Shift posted successfully. Amount deducted from wallet.",
+        wallet_paid: true,
+        facility_total: ft,
+        wallet_balance: balance - facilityTotal
+      });
+    }
+  }
+
+  // ── Insufficient wallet or user type not found — use Paystack ──
   try {
     const response = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
@@ -2867,6 +2901,359 @@ app.post("/finance/admin/invoice/:id/pay", async (req, res) => {
   } catch (err) {
     log("error", "Invoice pay error", { error: err.message });
     return res.status(500).json({ success: false, message: "Failed to mark invoice as paid." });
+  }
+});
+
+// ─────────────────────────────────────────────
+// Wallet system (facility & client)
+// ─────────────────────────────────────────────
+
+// Helper: get wallet table + balance column for a user type
+function walletTable(userType) {
+  return userType === "client" ? "clients" : "facilities";
+}
+
+// Helper: find user type by email
+async function resolveUserType(email) {
+  const { data: fac } = await supabase.from("facilities").select("id").eq("email", email).maybeSingle();
+  if (fac) return "facility";
+  const { data: cli } = await supabase.from("clients").select("id").eq("email", email).maybeSingle();
+  if (cli) return "client";
+  return null;
+}
+
+// Helper: get wallet balance
+async function getWalletBalance(email, userType) {
+  const table = walletTable(userType);
+  const { data } = await supabase.from(table).select("wallet_balance").eq("email", email).maybeSingle();
+  return data ? parseFloat(data.wallet_balance) || 0 : 0;
+}
+
+// Helper: update wallet balance and log transaction
+async function updateWallet(email, userType, type, amount, reference, description) {
+  const table = walletTable(userType);
+  const balanceBefore = await getWalletBalance(email, userType);
+  const delta = ["deposit", "refund", "admin_credit"].includes(type) ? amount : -amount;
+  const balanceAfter = Math.round((balanceBefore + delta) * 100) / 100;
+
+  const { error: updateError } = await supabase
+    .from(table)
+    .update({ wallet_balance: balanceAfter })
+    .eq("email", email);
+
+  if (updateError) throw updateError;
+
+  const { error: logError } = await supabase.from("wallet_transactions").insert({
+    user_email: email,
+    user_type: userType,
+    type,
+    amount: Math.abs(amount),
+    balance_before: balanceBefore,
+    balance_after: balanceAfter,
+    reference: reference || null,
+    description: description || ""
+  });
+
+  if (logError) throw logError;
+  return { balanceBefore, balanceAfter };
+}
+
+// ── GET /wallet/balance ──
+app.get("/wallet/balance", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const email = user.email.toLowerCase();
+    const userType = await resolveUserType(email);
+    if (!userType) return res.status(404).json({ success: false, message: "User not found." });
+    const balance = await getWalletBalance(email, userType);
+    return res.json({ success: true, data: { balance, user_type: userType } });
+  } catch (err) {
+    log("error", "Wallet balance error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to fetch balance." });
+  }
+});
+
+// ── GET /wallet/transactions ──
+app.get("/wallet/transactions", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const email = user.email.toLowerCase();
+    const { data: txns } = await supabase
+      .from("wallet_transactions")
+      .select("*")
+      .eq("user_email", email)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    return res.json({ success: true, data: txns || [] });
+  } catch (err) {
+    log("error", "Wallet transactions error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load transactions." });
+  }
+});
+
+// ── POST /wallet/deposit ── Initiate Paystack deposit
+app.post("/wallet/deposit", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
+
+  try {
+    const email = user.email.toLowerCase();
+    const amount = parseFloat(req.body.amount);
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: "Valid amount is required." });
+    }
+    if (amount < 10) {
+      return res.status(400).json({ success: false, message: "Minimum deposit is GHS 10." });
+    }
+
+    const response = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        email,
+        amount: Math.round(amount * 100),
+        currency: "GHS",
+        metadata: { wallet_deposit: true, user_email: email }
+      })
+    });
+
+    const data = await response.json();
+    if (!data.status) {
+      return res.status(400).json({ success: false, message: "Deposit initialization failed." });
+    }
+
+    return res.json({
+      success: true,
+      authorization_url: data.data.authorization_url,
+      reference: data.data.reference
+    });
+  } catch (err) {
+    log("error", "Wallet deposit error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Deposit service unavailable." });
+  }
+});
+
+// ── POST /wallet/deposit/verify ── Verify Paystack deposit and credit wallet
+app.post("/wallet/deposit/verify", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
+
+  try {
+    const reference = sanitize(req.body.reference);
+    if (!reference) return res.status(400).json({ success: false, message: "Reference required." });
+
+    // Check if already processed
+    const { data: existing } = await supabase
+      .from("wallet_transactions")
+      .select("id")
+      .eq("reference", reference)
+      .maybeSingle();
+
+    if (existing) {
+      return res.json({ success: true, message: "Deposit already verified.", already_processed: true });
+    }
+
+    const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+    });
+
+    const data = await response.json();
+    if (!data.status || data.data.status !== "success") {
+      return res.status(400).json({ success: false, message: "Deposit verification failed." });
+    }
+
+    const email = user.email.toLowerCase();
+    const amount = data.data.amount / 100;
+    const userType = await resolveUserType(email);
+    if (!userType) return res.status(404).json({ success: false, message: "User not found." });
+
+    await updateWallet(email, userType, "deposit", amount, reference, "Paystack deposit");
+
+    log("info", "Wallet deposit verified", { email, amount, reference });
+    return res.json({ success: true, message: `GHS ${amount.toLocaleString()} deposited successfully.`, amount });
+  } catch (err) {
+    log("error", "Wallet deposit verify error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Verification failed." });
+  }
+});
+
+// ── POST /wallet/withdraw ── Request withdrawal
+app.post("/wallet/withdraw", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  try {
+    const email = user.email.toLowerCase();
+    const amount = parseFloat(req.body.amount);
+    if (!amount || amount <= 0) return res.status(400).json({ success: false, message: "Valid amount required." });
+
+    const userType = await resolveUserType(email);
+    if (!userType) return res.status(404).json({ success: false, message: "User not found." });
+
+    const balance = await getWalletBalance(email, userType);
+    if (amount > balance) return res.status(400).json({ success: false, message: "Insufficient balance." });
+    if (amount < 10) return res.status(400).json({ success: false, message: "Minimum withdrawal is GHS 10." });
+
+    // Create withdrawal request (balance stays intact until admin approves)
+    const { data: request, error } = await supabase.from("withdrawal_requests").insert({
+      user_email: email,
+      user_type: userType,
+      amount,
+      bank_name: sanitize(req.body.bank_name || ""),
+      bank_account_number: sanitize(req.body.bank_account_number || ""),
+      bank_account_name: sanitize(req.body.bank_account_name || ""),
+      momo_provider: req.body.momo_provider || "",
+      momo_number: sanitize(req.body.momo_number || ""),
+      status: "pending"
+    }).select().single();
+
+    if (error) throw error;
+
+    // Notify admin
+    const adminEmails = ADMINS.join(",");
+    await supabase.from("notifications").insert({
+      user_email: adminEmails,
+      title: "Withdrawal request",
+      message: `${userType} ${email} requested GHS ${amount} withdrawal.`,
+      type: "info"
+    });
+
+    log("info", "Withdrawal requested", { email, amount, id: request.id });
+    return res.json({ success: true, message: "Withdrawal request submitted for admin approval.", id: request.id });
+  } catch (err) {
+    log("error", "Withdrawal request error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to submit withdrawal request." });
+  }
+});
+
+// ── GET /admin/wallet/withdrawals ── Admin lists withdrawal requests
+app.get("/admin/wallet/withdrawals", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { data: requests } = await supabase
+      .from("withdrawal_requests")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    return res.json({ success: true, data: requests || [] });
+  } catch (err) {
+    log("error", "Admin withdrawals error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load withdrawals." });
+  }
+});
+
+// ── POST /admin/wallet/withdraw/:id/approve ── Admin approves/rejects withdrawal
+app.post("/admin/wallet/withdraw/:id/:action", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const id = parseInt(req.params.id);
+    const action = req.params.action; // 'approve' or 'reject'
+    if (!["approve", "reject"].includes(action)) return res.status(400).json({ success: false, message: "Invalid action." });
+
+    const { data: wd } = await supabase
+      .from("withdrawal_requests")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (!wd) return res.status(404).json({ success: false, message: "Request not found." });
+    if (wd.status !== "pending") return res.json({ success: true, message: `Already ${wd.status}.` });
+
+    if (action === "approve") {
+      // Deduct from wallet and mark completed
+      await updateWallet(wd.user_email, wd.user_type, "withdrawal", wd.amount, null, "Withdrawal approved");
+      await supabase.from("withdrawal_requests").update({
+        status: "approved", processed_at: new Date().toISOString(), processed_by: user.email
+      }).eq("id", id);
+    } else {
+      await supabase.from("withdrawal_requests").update({
+        status: "rejected", processed_at: new Date().toISOString(), processed_by: user.email
+      }).eq("id", id);
+    }
+
+    await supabase.from("notifications").insert({
+      user_email: wd.user_email,
+      title: `Withdrawal ${action === "approve" ? "approved" : "rejected"}`,
+      message: action === "approve"
+        ? `Your withdrawal of GHS ${wd.amount} has been approved and deducted from your wallet.`
+        : `Your withdrawal of GHS ${wd.amount} has been rejected.`,
+      type: action === "approve" ? "success" : "info"
+    });
+
+    return res.json({ success: true, message: `Withdrawal ${action === "approve" ? "approved" : "rejected"}.` });
+  } catch (err) {
+    log("error", "Withdrawal action error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to process withdrawal." });
+  }
+});
+
+// ── POST /admin/wallet/credit ── Admin manually credits a wallet
+app.post("/admin/wallet/credit", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const email = sanitize(req.body.email);
+    const amount = parseFloat(req.body.amount);
+    const description = sanitize(req.body.description || "Manual credit");
+    if (!email || !amount || amount <= 0) return res.status(400).json({ success: false, message: "Valid email and amount required." });
+
+    const userType = await resolveUserType(email);
+    if (!userType) return res.status(404).json({ success: false, message: "User not found." });
+
+    await updateWallet(email, userType, "admin_credit", amount, null, description);
+
+    await supabase.from("notifications").insert({
+      user_email: email,
+      title: "Wallet credited",
+      message: `GHS ${amount.toLocaleString()} has been added to your wallet. ${description ? "Reason: " + description : ""}`,
+      type: "success"
+    });
+
+    log("info", "Admin wallet credit", { email, amount, admin: user.email });
+    return res.json({ success: true, message: `GHS ${amount.toLocaleString()} credited to ${email}.` });
+  } catch (err) {
+    log("error", "Admin wallet credit error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to credit wallet." });
+  }
+});
+
+// ── POST /admin/wallet/debit ── Admin manually debits a wallet
+app.post("/admin/wallet/debit", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  try {
+    const email = sanitize(req.body.email);
+    const amount = parseFloat(req.body.amount);
+    const description = sanitize(req.body.description || "Manual debit");
+    if (!email || !amount || amount <= 0) return res.status(400).json({ success: false, message: "Valid email and amount required." });
+
+    const userType = await resolveUserType(email);
+    if (!userType) return res.status(404).json({ success: false, message: "User not found." });
+
+    const balance = await getWalletBalance(email, userType);
+    if (amount > balance) return res.status(400).json({ success: false, message: "Insufficient balance." });
+
+    await updateWallet(email, userType, "admin_debit", amount, null, description);
+
+    log("info", "Admin wallet debit", { email, amount, admin: user.email });
+    return res.json({ success: true, message: `GHS ${amount.toLocaleString()} debited from ${email}.` });
+  } catch (err) {
+    log("error", "Admin wallet debit error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to debit wallet." });
   }
 });
 
