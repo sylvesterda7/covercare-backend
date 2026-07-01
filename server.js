@@ -1420,6 +1420,147 @@ app.get("/admin/analytics", async (req, res) => {
   }
 });
 
+// ── Admin: performance dashboard ──
+app.get("/admin/performance", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const { data: allShifts } = await supabase
+      .from("shifts")
+      .select("*, workers(full_name, email, role, city, profile_photo_url)")
+      .not("worker_id", "is", null);
+
+    const { data: allFacilities } = await supabase
+      .from("facilities")
+      .select("*");
+
+    const { data: allRatings } = await supabase
+      .from("ratings")
+      .select("*");
+
+    const facilityMap = {};
+    for (const f of allFacilities || []) {
+      facilityMap[f.email?.toLowerCase()] = f;
+    }
+
+    // ── Aggregate worker performance ──
+    const workerMap = {};
+    for (const s of allShifts || []) {
+      if (!s.worker_id) continue;
+      const wid = s.worker_id;
+      if (!workerMap[wid]) {
+        const w = s.workers || {};
+        workerMap[wid] = {
+          worker_id: wid,
+          full_name: w.full_name || "Unknown",
+          email: w.email || "",
+          role: w.role || "",
+          city: w.city || "",
+          photo_url: w.profile_photo_url || "",
+          completed: 0,
+          total_earnings: 0,
+          late_count: 0,
+          total_late_minutes: 0
+        };
+      }
+      const earnings = parsePayAmount(s.total_pay);
+      if (s.status === "completed") {
+        workerMap[wid].completed++;
+        workerMap[wid].total_earnings += earnings;
+        if (s.late_minutes && s.late_minutes > 0) {
+          workerMap[wid].late_count++;
+          workerMap[wid].total_late_minutes += s.late_minutes;
+        }
+      }
+    }
+
+    // ── Aggregate facility performance ──
+    // Need ALL shifts for facilities (including unfilled)
+    const { data: allShiftsForFacilities } = await supabase
+      .from("shifts")
+      .select("*");
+
+    const facilityPerf = {};
+    for (const s of allShiftsForFacilities || []) {
+      const email = s.contact_email?.toLowerCase();
+      if (!email) continue;
+      if (!facilityPerf[email]) {
+        const f = facilityMap[email] || {};
+        facilityPerf[email] = {
+          email,
+          facility_name: f.facility_name || s.facility_name || email,
+          facility_type: f.facility_type || s.facility_type || "",
+          city: f.city || s.city || "",
+          total_posted: 0,
+          completed: 0,
+          total_spend: 0,
+          credits_saved: 0
+        };
+      }
+      facilityPerf[email].total_posted++;
+      const facilityTotal = Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100;
+      if (s.status === "completed") {
+        facilityPerf[email].completed++;
+        facilityPerf[email].total_spend += facilityTotal;
+      }
+      if (s.facility_credit) {
+        facilityPerf[email].credits_saved += parseFloat(s.facility_credit) || 0;
+      }
+    }
+
+    // Add fill rate
+    for (const email of Object.keys(facilityPerf)) {
+      const p = facilityPerf[email];
+      p.fill_rate = p.total_posted > 0 ? Math.round((p.completed / p.total_posted) * 100) : 0;
+    }
+
+    // ── Ratings ──
+    const ratingMap = {};
+    for (const r of allRatings || []) {
+      const target = r.target_email?.toLowerCase();
+      if (!target) continue;
+      if (!ratingMap[target]) ratingMap[target] = [];
+      ratingMap[target].push(r.rating);
+    }
+
+    function avgRating(email) {
+      const ratings = ratingMap[email?.toLowerCase()];
+      if (!ratings || ratings.length === 0) return null;
+      return Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10;
+    }
+
+    // ── Build response ──
+    const allWorkers = Object.values(workerMap).map(w => ({
+      ...w,
+      avg_rating: avgRating(w.email),
+      on_time_rate: w.completed > 0 ? Math.round(((w.completed - w.late_count) / w.completed) * 100) : 100
+    }));
+
+    const allFacilitiesPerf = Object.values(facilityPerf).map(f => ({
+      ...f,
+      avg_rating: avgRating(f.email)
+    }));
+
+    // Sort
+    allWorkers.sort((a, b) => b.completed - a.completed || b.total_earnings - a.total_earnings);
+    allFacilitiesPerf.sort((a, b) => b.completed - a.completed || b.total_spend - a.total_spend);
+
+    return res.json({
+      success: true,
+      topWorkers: allWorkers.slice(0, 20),
+      topFacilities: allFacilitiesPerf.slice(0, 20),
+      workerCount: allWorkers.length,
+      facilityCount: allFacilitiesPerf.length,
+      totalCompleted: allShiftsForFacilities?.filter(s => s.status === "completed").length || 0
+    });
+  } catch (err) {
+    log("error", "Admin performance error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load performance data." });
+  }
+});
+
 // ── Admin: reset account ──
 app.post("/admin/reset-account", async (req, res) => {
   const user = await requireAuth(req, res);
