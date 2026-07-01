@@ -1675,21 +1675,64 @@ app.get("/finance/admin/transactions", async (req, res) => {
   }
 });
 
-// ── Admin: mark postpaid as paid ──
-app.post("/finance/admin/mark-paid", async (req, res) => {
-  const user = await requireAuth(req, res);
-  if (!user) return;
-  if (!requireAdmin(req, res)) return;
+// ── Admin: payment mediation ──
+async function updatePaymentStatus(shiftId, status, res) {
+  if (!shiftId) return res.status(400).json({ success: false, message: "shift_id is required." });
+  const { error } = await supabase.from("shifts").update({ payment_status: status, paid_at: status === "paid" ? new Date().toISOString() : status === "refunded" ? null : undefined }).eq("id", shiftId);
+  if (error) return res.status(500).json({ success: false, message: "Failed to update payment status." });
+  return res.json({ success: true, message: `Payment ${status}.` });
+}
+
+app.post("/admin/payment/hold", async (req, res) => {
+  const user = await requireAuth(req, res); if (!user) return; if (!requireAdmin(req, res)) return;
+  await updatePaymentStatus(req.body.shift_id, "held", res);
+  log("info", "Payment held by admin", { shift_id: req.body.shift_id, admin: user.email });
+});
+
+app.post("/admin/payment/release", async (req, res) => {
+  const user = await requireAuth(req, res); if (!user) return; if (!requireAdmin(req, res)) return;
+  await updatePaymentStatus(req.body.shift_id, "paid", res);
+  log("info", "Payment released by admin", { shift_id: req.body.shift_id, admin: user.email });
+});
+
+app.post("/admin/payment/refund", async (req, res) => {
+  const user = await requireAuth(req, res); if (!user) return; if (!requireAdmin(req, res)) return;
+  await updatePaymentStatus(req.body.shift_id, "refunded", res);
+  log("info", "Payment refunded by admin", { shift_id: req.body.shift_id, admin: user.email });
+});
+
+app.post("/admin/payment/complete", async (req, res) => {
+  const user = await requireAuth(req, res); if (!user) return; if (!requireAdmin(req, res)) return;
+  await updatePaymentStatus(req.body.shift_id, "completed", res);
+  log("info", "Payment completed by admin", { shift_id: req.body.shift_id, admin: user.email });
+});
+
+app.get("/admin/payments", async (req, res) => {
+  const user = await requireAuth(req, res); if (!user) return; if (!requireAdmin(req, res)) return;
   try {
-    const { shift_id } = req.body;
-    if (!shift_id) return res.status(400).json({ success: false, message: "shift_id is required." });
-    const { error } = await supabase.from("shifts").update({ payment_status: "paid", paid_at: new Date().toISOString() }).eq("id", shift_id);
-    if (error) return res.status(500).json({ success: false, message: "Failed to update shift." });
-    log("info", "Shift marked as paid by admin", { shift_id });
-    return res.json({ success: true, message: "Shift marked as paid." });
+    const { data: shifts, error } = await supabase.from("shifts").select("*").order("created_at", { ascending: false });
+    if (error) return res.status(500).json({ success: false, message: "Failed to load payments." });
+    const payments = (shifts || []).map(s => ({
+      id: s.id,
+      facility_name: s.facility_name,
+      contact_email: s.contact_email,
+      role_needed: s.role_needed,
+      worker_id: s.worker_id,
+      shift_date: s.shift_date,
+      start_time: s.start_time,
+      duration: s.duration,
+      total_pay: parsePayAmount(s.total_pay),
+      facility_total: Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100,
+      payment_status: s.payment_status,
+      facility_credit: s.facility_credit,
+      waived: s.waived,
+      paid_at: s.paid_at,
+      created_at: s.created_at
+    }));
+    return res.json({ success: true, data: payments });
   } catch (err) {
-    log("error", "Admin mark paid error", { error: err.message });
-    return res.status(500).json({ success: false, message: "Failed to mark shift as paid." });
+    log("error", "Admin payments list error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load payments." });
   }
 });
 
