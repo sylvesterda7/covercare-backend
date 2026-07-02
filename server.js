@@ -412,6 +412,8 @@ app.get("/verify", async (req, res) => {
 
   const registration_number = sanitize(req.query.registration_number);
   const name = sanitize(req.query.name);
+  const country = (req.query.country || "").toUpperCase();
+  const role = (req.query.role || "").toLowerCase();
 
   if (!registration_number) {
     return res.status(400).json({ success: false, message: "Registration number is required." });
@@ -420,77 +422,93 @@ app.get("/verify", async (req, res) => {
     return res.status(400).json({ success: false, message: "Name is required for verification." });
   }
 
-  log("info", "Verifying license", { registration_number, name });
+  log("info", "Verifying license", { registration_number, name, country, role });
 
-  const nameParts = name.toLowerCase().trim().split(" ");
-  const firstName = nameParts[0] || "";
-  const lastName = nameParts[nameParts.length - 1] || "";
+  // Currently only auto-verify for Ghana pharmacists via Pharmacy Council website
+  if (country === "GH" && role === "pharmacist") {
 
-  let page;
-  try {
-    const browser = await browserPool.getBrowser();
-    page = await browser.newPage();
+    const nameParts = name.toLowerCase().trim().split(" ");
+    const firstName = nameParts[0] || "";
+    const lastName = nameParts[nameParts.length - 1] || "";
 
-    await page.goto("https://forms.pcghana.org/#/search", {
-      waitUntil: "networkidle2",
-      timeout: 15000
-    });
+    let page;
+    try {
+      const browser = await browserPool.getBrowser();
+      page = await browser.newPage();
 
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    await page.waitForSelector("select", { timeout: 10000 });
-
-    const options = await page.evaluate(() => {
-      const select = document.querySelector("select");
-      if (!select) return [];
-      return Array.from(select.options).map(o => ({ value: o.value, text: o.text }));
-    });
-
-    const pharmacistOption = options.find(o => o.text.toLowerCase().includes("pharmacist"));
-    if (pharmacistOption) {
-      await page.select("select", pharmacistOption.value);
-    }
-
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    await page.waitForSelector("input[type='text']", { timeout: 10000 });
-    await page.click("input[type='text']", { clickCount: 3 });
-    await page.type("input[type='text']", registration_number);
-    await page.keyboard.press("Enter");
-    await new Promise(resolve => setTimeout(resolve, 6000));
-
-    const resultText = await page.evaluate(() => document.body.innerText.toLowerCase());
-
-    const hasResultRow = resultText.includes("no results") === false && /\d+\s+\w+\s+\w+/.test(resultText);
-    const nameMatches = resultText.includes(firstName) || resultText.includes(lastName);
-    const hasResults = hasResultRow && nameMatches;
-
-    log("info", "Verification result", { registration_number, hasResultRow, nameMatches });
-
-    if (hasResults) {
-      return res.json({
-        success: true,
-        message: "License verified in good standing with the Pharmacy Council.",
-        data: { status: "verified_good", registration_number, name_verified: name, source: "Pharmacy Council Ghana" }
+      await page.goto("https://forms.pcghana.org/#/search", {
+        waitUntil: "networkidle2",
+        timeout: 15000
       });
-    } else if (hasResultRow && !nameMatches) {
+
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      await page.waitForSelector("select", { timeout: 10000 });
+
+      const options = await page.evaluate(() => {
+        const select = document.querySelector("select");
+        if (!select) return [];
+        return Array.from(select.options).map(o => ({ value: o.value, text: o.text }));
+      });
+
+      const pharmacistOption = options.find(o => o.text.toLowerCase().includes("pharmacist"));
+      if (pharmacistOption) {
+        await page.select("select", pharmacistOption.value);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      await page.waitForSelector("input[type='text']", { timeout: 10000 });
+      await page.click("input[type='text']", { clickCount: 3 });
+      await page.type("input[type='text']", registration_number);
+      await page.keyboard.press("Enter");
+      await new Promise(resolve => setTimeout(resolve, 6000));
+
+      const resultText = await page.evaluate(() => document.body.innerText.toLowerCase());
+
+      const hasResultRow = resultText.includes("no results") === false && /\d+\s+\w+\s+\w+/.test(resultText);
+      const nameMatches = resultText.includes(firstName) || resultText.includes(lastName);
+      const hasResults = hasResultRow && nameMatches;
+
+      log("info", "Verification result", { registration_number, hasResultRow, nameMatches });
+
+      if (hasResults) {
+        return res.json({
+          success: true,
+          message: "License verified in good standing with the relevant regulatory body.",
+          data: { status: "verified_good", registration_number, name_verified: name, source: "regulatory_body" }
+        });
+      } else if (hasResultRow && !nameMatches) {
+        return res.json({
+          success: false,
+          message: "Registration number found but name does not match regulatory records. Check that your full name matches exactly as registered.",
+          data: { status: "name_mismatch", registration_number, source: "regulatory_body" }
+        });
+      } else {
+        return res.json({
+          success: false,
+          message: "Registration number not found in regulatory records. Please check and try again.",
+          data: { status: "not_found", registration_number, source: "regulatory_body" }
+        });
+      }
+
+    } catch (err) {
+      log("error", "Verification error", { error: err.message });
       return res.json({
         success: false,
-        message: "Registration number found but name does not match Council records.",
-        data: { status: "name_mismatch", registration_number, source: "Pharmacy Council Ghana" }
+        message: "Auto-verification is temporarily unavailable. Please upload your license document for manual review.",
+        data: { status: "manual_review", registration_number }
       });
-    } else {
-      return res.json({
-        success: false,
-        message: "Registration number not found in Pharmacy Council records.",
-        data: { status: "not_found", registration_number, source: "Pharmacy Council Ghana" }
-      });
+    } finally {
+      if (page) await page.close();
     }
 
-  } catch (err) {
-    log("error", "Verification error", { error: err.message });
-    return res.status(500).json({ success: false, message: "Verification service temporarily unavailable." });
-  } finally {
-    if (page) await page.close();
   }
+
+  // For all other countries/roles — manual review required
+  return res.json({
+    success: false,
+    message: `Auto-verification is not yet available for this profession in your country. Please upload your license document for manual review by our team within 24 hours.`,
+    data: { status: "manual_review", registration_number, country, role }
+  });
 });
 
 app.post("/verify-identity", async (req, res) => {
