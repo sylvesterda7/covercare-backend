@@ -425,92 +425,130 @@ app.get("/verify", async (req, res) => {
 
   log("info", "Verifying license", { registration_number, name, country, role });
 
-  // Currently only auto-verify for Ghana pharmacists via Pharmacy Council website
+  // Currently only auto-verify for Ghana pharmacists
   if (country === "GH" && role === "pharmacist") {
-
-    const nameParts = name.toLowerCase().trim().split(" ");
-    const firstName = nameParts[0] || "";
-    const lastName = nameParts[nameParts.length - 1] || "";
-
-    let page;
-    try {
-      const browser = await browserPool.getBrowser();
-      page = await browser.newPage();
-
-      await page.goto("https://forms.pcghana.org/#/search", {
-        waitUntil: "networkidle2",
-        timeout: 15000
-      });
-
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      await page.waitForSelector("select", { timeout: 10000 });
-
-      const options = await page.evaluate(() => {
-        const select = document.querySelector("select");
-        if (!select) return [];
-        return Array.from(select.options).map(o => ({ value: o.value, text: o.text }));
-      });
-
-      const pharmacistOption = options.find(o => o.text.toLowerCase().includes("pharmacist"));
-      if (pharmacistOption) {
-        await page.select("select", pharmacistOption.value);
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      await page.waitForSelector("input[type='text']", { timeout: 10000 });
-      await page.click("input[type='text']", { clickCount: 3 });
-      await page.type("input[type='text']", registration_number);
-      await page.keyboard.press("Enter");
-      await new Promise(resolve => setTimeout(resolve, 6000));
-
-      const resultText = await page.evaluate(() => document.body.innerText.toLowerCase());
-
-      const hasResultRow = resultText.includes("no results") === false && /\d+\s+\w+\s+\w+/.test(resultText);
-      const nameMatches = resultText.includes(firstName) || resultText.includes(lastName);
-      const hasResults = hasResultRow && nameMatches;
-
-      log("info", "Verification result", { registration_number, hasResultRow, nameMatches });
-
-      if (hasResults) {
-        return res.json({
-          success: true,
-          message: "License verified in good standing with the relevant regulatory body.",
-          data: { status: "verified_good", registration_number, name_verified: name, source: "regulatory_body" }
-        });
-      } else if (hasResultRow && !nameMatches) {
-        return res.json({
-          success: false,
-          message: "Registration number found but name does not match regulatory records. Check that your full name matches exactly as registered.",
-          data: { status: "name_mismatch", registration_number, source: "regulatory_body" }
-        });
-      } else {
-        return res.json({
-          success: false,
-          message: "Registration number not found in regulatory records. Please check and try again.",
-          data: { status: "not_found", registration_number, source: "regulatory_body" }
-        });
-      }
-
-    } catch (err) {
-      log("error", "Verification error", { error: err.message });
-      return res.json({
-        success: false,
-        message: "Auto-verification is temporarily unavailable. Please upload your license document for manual review.",
-        data: { status: "manual_review", registration_number }
-      });
-    } finally {
-      if (page) await page.close();
-    }
-
+    return await verifyGhanaPharmacist(req, res, registration_number, name);
   }
 
-  // For all other countries/roles — manual review required
   return res.json({
     success: false,
-    message: `Auto-verification is not yet available for this profession in your country. Please upload your license document for manual review by our team within 24 hours.`,
+    message: `Auto-verification is not yet available for this profession in your country. Please upload your license document for manual review.`,
     data: { status: "manual_review", registration_number, country, role }
   });
 });
+
+async function verifyGhanaPharmacist(req, res, registration_number, name) {
+  const nameParts = name.toLowerCase().trim().split(/\s+/);
+  const firstName = nameParts[0] || "";
+  const lastName = nameParts[nameParts.length - 1] || "";
+  let page;
+  let browser;
+
+  try {
+    browser = await browserPool.getBrowser();
+    page = await browser.newPage();
+
+    await page.goto("https://forms.pcghana.org/#/search", {
+      waitUntil: "networkidle2",
+      timeout: 20000
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await page.waitForSelector("select", { timeout: 10000 });
+
+    const options = await page.evaluate(() => {
+      const select = document.querySelector("select");
+      if (!select) return [];
+      return Array.from(select.options).map(o => ({ value: o.value, text: o.text }));
+    });
+
+    const pharmacistOption = options.find(o => o.text.toLowerCase().includes("pharmacist"));
+    if (pharmacistOption) {
+      await page.select("select", pharmacistOption.value);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // Find the search input — try text type first, then search type
+    const inputEl = await page.evaluate(() => {
+      const inputs = document.querySelectorAll("input");
+      for (const inp of inputs) {
+        if (inp.type === "text" || inp.type === "search") return true;
+      }
+      return false;
+    });
+
+    if (!inputEl) {
+      throw new Error("Search input not found on page");
+    }
+
+    const selector = "input[type='text'], input[type='search']";
+    await page.waitForSelector(selector, { timeout: 8000 });
+    await page.click(selector, { clickCount: 3 });
+    await page.type(selector, registration_number);
+    await page.keyboard.press("Enter");
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    const resultText = bodyText.toLowerCase();
+
+    log("info", "PC Ghana response snippet", { snippet: bodyText.substring(0, 600) });
+
+    // Detect "no results" messages
+    const noResultsPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no matching"];
+    const showsNoResults = noResultsPhrases.some(p => resultText.includes(p));
+
+    // Detect if any data rows were returned (look for registration-like patterns)
+    const hasDataRows = /\b\d{3,}\b/.test(resultText);
+
+    // Check if name appears in the text
+    const nameFound = (firstName.length > 2 && resultText.includes(firstName)) ||
+                      (lastName.length > 2 && resultText.includes(lastName));
+
+    log("info", "Verification parsed", { showsNoResults, hasDataRows, nameFound });
+
+    if (!showsNoResults && hasDataRows && nameFound) {
+      return res.json({
+        success: true,
+        message: "License verified in good standing with the relevant regulatory body.",
+        data: { status: "verified_good", registration_number, name_verified: name }
+      });
+    }
+
+    if (!showsNoResults && hasDataRows && !nameFound) {
+      return res.json({
+        success: false,
+        message: "Registration number found but name does not match regulatory records. Check that your full name matches exactly as registered with your professional body.",
+        data: { status: "name_mismatch", registration_number }
+      });
+    }
+
+    return res.json({
+      success: false,
+      message: "Registration number not found in regulatory records. Please check and try again, or upload your license certificate for manual review.",
+      data: { status: "not_found", registration_number }
+    });
+
+  } catch (err) {
+    log("error", "Verification error", { error: err.message });
+
+    // Kill the browser instance so the next request gets a fresh one
+    try {
+      if (browserPool.instance) {
+        await browserPool.instance.close().catch(() => {});
+        browserPool.instance = null;
+      }
+    } catch (_) {}
+
+    return res.json({
+      success: false,
+      message: "Verification service is temporarily unavailable. Please try again or upload your license document for manual review.",
+      data: { status: "manual_review", registration_number }
+    });
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
 
 app.post("/verify-identity", async (req, res) => {
   const user = await requireAuth(req, res);
@@ -2221,7 +2259,7 @@ app.put("/worker", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { full_name, phone, role, license_number, city, country, experience, profile_photo_url, bio } = req.body;
+  const { full_name, phone, role, license_number, city, country, experience, profile_photo_url, bio, license_file_url } = req.body;
 
   const { data: existing } = await supabase
     .from("workers")
@@ -2243,6 +2281,7 @@ app.put("/worker", async (req, res) => {
   if (experience) updates.experience = sanitize(experience);
   if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
   if (bio !== undefined) updates.bio = sanitize(bio);
+  if (license_file_url) updates.license_file_url = license_file_url;
 
   const { error } = await supabase.from("workers").update(updates).eq("id", existing.id);
 
