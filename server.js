@@ -302,7 +302,7 @@ app.post("/worker", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { full_name, email, phone, role, license_number, city, country, experience, profile_photo_url, bio } = body;
+  const { full_name, email, phone, role, license_number, license_verified, city, country, experience, profile_photo_url, bio, license_file_url } = body;
 
   if (!full_name || !email || !phone || !role || !city) {
     return res.status(400).json({ success: false, message: "full_name, email, phone, role, and city are required." });
@@ -313,9 +313,10 @@ app.post("/worker", async (req, res) => {
   }
 
   const insertData = {
-    full_name, email, phone, role, license_number, license_verified: false, city, country, experience, bio
+    full_name, email, phone, role, license_number, license_verified: !!license_verified, city, country, experience, bio
   };
   if (profile_photo_url) insertData.profile_photo_url = profile_photo_url;
+  if (license_file_url) insertData.license_file_url = license_file_url;
 
   const { error } = await supabase.from("workers").insert([insertData]);
 
@@ -1883,6 +1884,44 @@ app.post("/admin/toggle-license", async (req, res) => {
 
   log("info", "License toggled", { worker_id, new_status: !current_status });
   return res.json({ success: true, message: "Worker updated." });
+});
+
+// ── Admin: activate a worker account ──
+app.post("/admin/activate-worker", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { worker_id } = req.body;
+  if (!worker_id) {
+    return res.status(400).json({ success: false, message: "worker_id is required." });
+  }
+
+  const { error } = await supabase
+    .from("workers")
+    .update({ activated: true, activated_at: new Date().toISOString() })
+    .eq("id", worker_id);
+
+  if (error) {
+    log("error", "Admin activate worker error", { error: error.message, worker_id });
+    return res.status(500).json({ success: false, message: "Failed to activate worker." });
+  }
+
+  // Notify the worker
+  try {
+    const { data: worker } = await supabase.from("workers").select("email, full_name").eq("id", worker_id).single();
+    if (worker) {
+      await supabase.from("notifications").insert({
+        email: worker.email,
+        title: "Account activated!",
+        message: `Your account has been reviewed and activated. You can now accept shifts and start working.`,
+        type: "account"
+      });
+    }
+  } catch (_) {}
+
+  log("info", "Worker activated by admin", { worker_id, admin: user.email });
+  return res.json({ success: true, message: "Worker activated successfully." });
 });
 
 // ── Admin: approve facility for postpaid billing ──
