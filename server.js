@@ -1909,6 +1909,30 @@ app.get("/admin/facility/:id", async (req, res) => {
   }
 });
 
+// ── Admin: list all clients ──
+app.get("/admin/clients", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const { data: clients, error } = await supabase
+      .from("clients")
+      .select("*")
+      .order("id", { ascending: false });
+
+    if (error) {
+      log("error", "Admin list clients error", { error: error.message });
+      return res.status(500).json({ success: false, message: "Failed to load clients.", error: error.message });
+    }
+
+    return res.json({ success: true, clients: clients || [] });
+  } catch (err) {
+    log("error", "Admin list clients error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load clients." });
+  }
+});
+
 // ── Admin: get full client detail ──
 app.get("/admin/client/:id", async (req, res) => {
   const user = await requireAuth(req, res);
