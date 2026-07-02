@@ -123,7 +123,7 @@ function log(level, message, data = {}) {
 const browserPool = {
   instance: null,
   async getBrowser() {
-    if (!this.instance || !this.instance.isConnected()) {
+    if (!this.instance || !this.instance.connected) {
       this.instance = await puppeteer.launch({
         headless: true,
         args: ["--no-sandbox", "--disable-setuid-sandbox"]
