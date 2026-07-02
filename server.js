@@ -126,7 +126,8 @@ const SHIFT_FIELDS = [
   "contact_email", "contact_phone", "role_needed", "shift_date",
   "start_time", "duration", "pay_rate", "total_pay",
   "duration_hours", "days_needed", "workers_needed",
-  "experience_required", "urgency", "notes"
+  "experience_required", "urgency", "notes",
+  "assigned_to_worker_id", "branch_id", "branch_name"
 ];
 
 function pickShiftFields(data) {
@@ -1152,12 +1153,16 @@ app.post("/applications/apply", async (req, res) => {
 
   const { data: shift } = await supabase
     .from("shifts")
-    .select("id, status, contact_email, role_needed, shift_date")
+    .select("id, status, contact_email, role_needed, shift_date, assigned_to_worker_id")
     .eq("id", shift_id)
     .single();
 
   if (!shift || shift.status !== "open") {
     return res.status(400).json({ success: false, message: "This shift is no longer accepting applications." });
+  }
+
+  if (shift.assigned_to_worker_id && shift.assigned_to_worker_id !== parseInt(worker_id)) {
+    return res.status(403).json({ success: false, message: "This shift is assigned to another worker." });
   }
 
   const { data: existing } = await supabase
@@ -1190,6 +1195,26 @@ app.post("/applications/apply", async (req, res) => {
     read: false,
     created_at: new Date().toISOString()
   }]).catch(() => {});
+
+  // ── Auto-accept if worker is the preassigned worker ──
+  if (shift.assigned_to_worker_id && parseInt(shift.assigned_to_worker_id) === parseInt(worker_id)) {
+    const qrToken = require("crypto").randomBytes(32).toString("hex");
+    const qrUrl = `${process.env.ARRIVE_BASE_URL || "https://covercare-africa.vercel.app"}/arrive?shift_id=${shift_id}&worker_id=${worker_id}&token=${qrToken}`;
+    const { error: acceptError } = await supabase
+      .from("shifts")
+      .update({ worker_id, qr_token: qrToken, status: "accepted" })
+      .eq("id", shift_id);
+    if (!acceptError) {
+      log("info", "Preassigned shift auto-accepted", { worker_id, shift_id });
+      return res.json({
+        success: true,
+        message: "Assigned shift accepted! Show the QR code on arrival.",
+        auto_accepted: true,
+        qr_url: qrUrl,
+        qr_token: qrToken
+      });
+    }
+  }
 
   log("info", "Application submitted", { worker_id, shift_id });
   return res.json({ success: true, message: "Application submitted successfully.", data });
@@ -4384,6 +4409,94 @@ app.put("/settings/facility", async (req, res) => {
   } catch (err) {
     log("error", "Settings facility update error", { error: err.message });
     return res.status(500).json({ success: false, message: "Failed to update facility." });
+  }
+});
+
+// ── Facility branches ──
+app.get("/facility/branches", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  try {
+    const { data, error } = await supabase.from("facility_branches").select("*").eq("facility_email", user.email.toLowerCase()).order("name");
+    if (error) return res.status(500).json({ success: false, message: "Failed to load branches." });
+    return res.json({ success: true, data: data || [] });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post("/facility/branches", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  const { name, city, address, latitude, longitude, phone } = req.body;
+  if (!name || !city) return res.status(400).json({ success: false, message: "Branch name and city are required." });
+  try {
+    const { data, error } = await supabase.from("facility_branches").insert([{
+      facility_email: user.email.toLowerCase(), name: sanitize(name),
+      city: sanitize(city), address: address ? sanitize(address) : null,
+      latitude: latitude || null, longitude: longitude || null,
+      phone: phone ? sanitize(phone) : null
+    }]).select().single();
+    if (error) return res.status(500).json({ success: false, message: "Failed to create branch." });
+    return res.json({ success: true, data });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.put("/facility/branches/:id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  const { id } = req.params;
+  const { name, city, address, latitude, longitude, phone } = req.body;
+  try {
+    const { data: existing } = await supabase.from("facility_branches").select("id").eq("id", id).eq("facility_email", user.email.toLowerCase()).maybeSingle();
+    if (!existing) return res.status(404).json({ success: false, message: "Branch not found." });
+    const updates = {};
+    if (name) updates.name = sanitize(name);
+    if (city) updates.city = sanitize(city);
+    if (address !== undefined) updates.address = sanitize(address);
+    if (latitude !== undefined) updates.latitude = latitude;
+    if (longitude !== undefined) updates.longitude = longitude;
+    if (phone !== undefined) updates.phone = sanitize(phone);
+    const { data, error } = await supabase.from("facility_branches").update(updates).eq("id", id).select().single();
+    if (error) return res.status(500).json({ success: false, message: "Failed to update branch." });
+    return res.json({ success: true, data });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.delete("/facility/branches/:id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  const { id } = req.params;
+  try {
+    const { data: existing } = await supabase.from("facility_branches").select("id").eq("id", id).eq("facility_email", user.email.toLowerCase()).maybeSingle();
+    if (!existing) return res.status(404).json({ success: false, message: "Branch not found." });
+    const { error } = await supabase.from("facility_branches").delete().eq("id", id);
+    if (error) return res.status(500).json({ success: false, message: "Failed to delete branch." });
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Worker search for pre-assignment ──
+app.get("/workers/search", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  const { role, city, q } = req.query;
+  try {
+    let query = supabase.from("workers").select("id, full_name, email, phone, role, city, experience, profile_photo_url, license_verified, identity_verified");
+    if (role) query = query.eq("role", role);
+    if (city) query = query.eq("city", city);
+    if (q) query = query.or(`full_name.ilike.%${q}%,email.ilike.%${q}%`);
+    const { data, error } = await query.limit(30);
+    if (error) return res.status(500).json({ success: false, message: "Search failed." });
+    return res.json({ success: true, data: data || [] });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
