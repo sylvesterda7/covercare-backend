@@ -40,9 +40,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// Trims/length-caps string input for storage. Does NOT strip characters like
+// quotes/apostrophes/ampersands — that corrupts legitimate data (e.g. "O'Brien").
+// SQL injection is not a concern here since all queries go through the
+// Supabase client (parameterized), and any HTML rendering of this data must
+// escape it at render time (see escapeHtml() on the frontend).
 function sanitize(str) {
   if (!str) return "";
-  return str.toString().replace(/[<>'";&]/g, "").trim().substring(0, 200);
+  return str.toString().trim().substring(0, 200);
 }
 
 const rateLimit = {};
@@ -302,7 +307,7 @@ app.post("/worker", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { full_name, email, phone, role, license_number, license_verified, city, country, experience, profile_photo_url, bio, license_file_url } = body;
+  const { full_name, email, phone, role, license_number, city, country, experience, profile_photo_url, bio, license_file_url } = body;
 
   if (!full_name || !email || !phone || !role || !city) {
     return res.status(400).json({ success: false, message: "full_name, email, phone, role, and city are required." });
@@ -313,7 +318,9 @@ app.post("/worker", async (req, res) => {
   }
 
   const insertData = {
-    full_name, email, phone, role, license_number, license_verified: !!license_verified, city, country, experience, bio
+    // license_verified is never taken from client input — it can only be set
+    // by an admin via /admin/toggle-license, so a new worker always starts unverified.
+    full_name, email, phone, role, license_number, license_verified: false, city, country, experience, bio
   };
   if (profile_photo_url) insertData.profile_photo_url = profile_photo_url;
   if (license_file_url) insertData.license_file_url = license_file_url;
@@ -322,7 +329,7 @@ app.post("/worker", async (req, res) => {
 
   if (error) {
     log("error", "Worker save error", { error: error.message });
-    return res.status(500).json({ success: false, message: "Failed to save worker.", error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to save worker." });
   }
 
   log("info", "Worker saved", { email });
@@ -355,7 +362,7 @@ app.post("/facility", async (req, res) => {
 
   if (error) {
     log("error", "Facility save error", { error: error.message });
-    return res.status(500).json({ success: false, message: "Failed to save facility.", error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to save facility." });
   }
 
   log("info", "Facility saved", { facility_name });
@@ -392,7 +399,7 @@ app.post("/client", async (req, res) => {
 
   if (error) {
     log("error", "Client save error", { error: error.message });
-    return res.status(500).json({ success: false, message: "Failed to save client.", error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to save client." });
   }
 
   log("info", "Client saved", { email });
@@ -691,19 +698,24 @@ app.post("/verify-identity", async (req, res) => {
     return res.status(404).json({ success: false, message: "Worker profile not found for this email." });
   }
 
-  const updateData = { identity_verified: true, identity_verified_at: new Date().toISOString() };
+  // The face-match check that led to this call ran entirely in the caller's
+  // browser, so we cannot trust it as proof of identity — anyone can call this
+  // endpoint directly. We only store the submitted evidence here; an admin
+  // must confirm it via /admin/toggle-identity before identity_verified flips.
+  const updateData = {};
   if (selfie_url) updateData.selfie_url = selfie_url;
   if (id_document_url) updateData.id_document_url = id_document_url;
 
-  const { error } = await supabase.from("workers").update(updateData).eq("email", email);
-
-  if (error) {
-    log("error", "Identity update error", { error: error.message });
-    return res.status(500).json({ success: false, message: "Failed to update identity status." });
+  if (Object.keys(updateData).length > 0) {
+    const { error } = await supabase.from("workers").update(updateData).eq("email", email);
+    if (error) {
+      log("error", "Identity update error", { error: error.message });
+      return res.status(500).json({ success: false, message: "Failed to save verification documents." });
+    }
   }
 
-  log("info", "Identity verified", { email });
-  return res.json({ success: true, message: "Identity verified successfully." });
+  log("info", "Identity documents submitted for review", { email });
+  return res.json({ success: true, message: "Documents submitted. Your identity is pending review by our team." });
 });
 
 app.post("/payment/initialize", async (req, res) => {
@@ -717,6 +729,9 @@ app.post("/payment/initialize", async (req, res) => {
 
   if (!email || !amount || amount <= 0) {
     return res.status(400).json({ success: false, message: "Valid email and amount are required." });
+  }
+  if (user.email.toLowerCase() !== email.toLowerCase()) {
+    return res.status(403).json({ success: false, message: "Email does not match your authenticated account." });
   }
   if (!shift_data) {
     return res.status(400).json({ success: false, message: "shift_data is required." });
@@ -772,8 +787,18 @@ app.post("/payment/initialize", async (req, res) => {
   if (userType) {
     const balance = await getWalletBalance(email, userType);
     if (balance >= facilityTotal) {
-      // Sufficient wallet balance — deduct and create shift directly
-      await updateWallet(email, userType, "deduction", facilityTotal, null, `Shift posting: ${shift_data.role_needed || ""} ${shift_data.shift_date || ""}`);
+      // Sufficient wallet balance — deduct (atomically) and create shift directly
+      let walletResult;
+      try {
+        walletResult = await updateWallet(email, userType, "deduction", facilityTotal, null, `Shift posting: ${shift_data.role_needed || ""} ${shift_data.shift_date || ""}`);
+      } catch (walletErr) {
+        if (walletErr.code === "INSUFFICIENT_BALANCE" || walletErr.code === "WALLET_CONTENTION") {
+          return res.status(400).json({ success: false, message: "Wallet balance changed. Please try again." });
+        }
+        log("error", "Wallet deduction error", { error: walletErr.message, email });
+        return res.status(500).json({ success: false, message: "Failed to charge wallet." });
+      }
+
       const shiftFields = pickShiftFields(shift_data);
       shiftFields.contact_email = user.email;
       shiftFields.payment_status = "paid";
@@ -795,7 +820,7 @@ app.post("/payment/initialize", async (req, res) => {
         message: "Shift posted successfully. Amount deducted from wallet.",
         wallet_paid: true,
         facility_total: ft,
-        wallet_balance: balance - facilityTotal
+        wallet_balance: walletResult.balanceAfter
       });
     }
   }
@@ -1923,7 +1948,7 @@ app.get("/admin/clients", async (req, res) => {
 
     if (error) {
       log("error", "Admin list clients error", { error: error.message });
-      return res.status(500).json({ success: false, message: "Failed to load clients.", error: error.message });
+      return res.status(500).json({ success: false, message: "Failed to load clients." });
     }
 
     return res.json({ success: true, clients: clients || [] });
@@ -2111,6 +2136,30 @@ app.post("/admin/toggle-license", async (req, res) => {
   }
 
   log("info", "License toggled", { worker_id, new_status: !current_status });
+  return res.json({ success: true, message: "Worker updated." });
+});
+
+app.post("/admin/toggle-identity", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { worker_id, current_status } = req.body;
+  if (!worker_id) {
+    return res.status(400).json({ success: false, message: "worker_id is required." });
+  }
+
+  const newStatus = !current_status;
+  const { error } = await supabase
+    .from("workers")
+    .update({ identity_verified: newStatus, identity_verified_at: newStatus ? new Date().toISOString() : null })
+    .eq("id", worker_id);
+
+  if (error) {
+    return res.status(500).json({ success: false, message: "Failed to update worker." });
+  }
+
+  log("info", "Identity verification toggled", { worker_id, new_status: newStatus, admin: user.email });
   return res.json({ success: true, message: "Worker updated." });
 });
 
@@ -2406,13 +2455,21 @@ app.get("/admin/payments", async (req, res) => {
   }
 });
 
+const ALLOWED_UPLOAD_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+
 app.post("/api/upload", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
 
   const { image, folder } = req.body;
   if (!image) {
     return res.status(400).json({ success: false, message: "Image data is required." });
+  }
+
+  const mimeMatch = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,/.exec(image);
+  if (!mimeMatch || !ALLOWED_UPLOAD_MIME_TYPES.includes(mimeMatch[1].toLowerCase())) {
+    return res.status(400).json({ success: false, message: "File must be a JPG, PNG, WEBP, or PDF." });
   }
 
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
@@ -3235,9 +3292,14 @@ async function resolveUserType(email) {
 
 // Route: check if email belongs to a worker (used by login.js routing)
 app.post("/worker/by-email", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
   try {
     const { email } = req.body;
-    if (!email) return res.json({ success: false, message: "Email required" });
+    if (!email || user.email.toLowerCase() !== email.toLowerCase()) {
+      return res.json({ success: false, message: "Email required" });
+    }
     const { data } = await supabase.from("workers").select("id").eq("email", email).maybeSingle();
     res.json({ success: !!data });
   } catch (e) {
@@ -3247,9 +3309,14 @@ app.post("/worker/by-email", async (req, res) => {
 
 // Route: check if email belongs to a facility (used by login.js routing)
 app.post("/facility/by-email", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
   try {
     const { email } = req.body;
-    if (!email) return res.json({ success: false, message: "Email required" });
+    if (!email || user.email.toLowerCase() !== email.toLowerCase()) {
+      return res.json({ success: false, message: "Email required" });
+    }
     const { data } = await supabase.from("facilities").select("id").eq("email", email).maybeSingle();
     res.json({ success: !!data });
   } catch (e) {
@@ -3259,9 +3326,14 @@ app.post("/facility/by-email", async (req, res) => {
 
 // Route: check if email belongs to a client (used by login.js routing)
 app.post("/client/by-email", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 20)) return;
   try {
     const { email } = req.body;
-    if (!email) return res.json({ success: false, message: "Email required" });
+    if (!email || user.email.toLowerCase() !== email.toLowerCase()) {
+      return res.json({ success: false, message: "Email required" });
+    }
     const { data } = await supabase.from("clients").select("id").eq("email", email).maybeSingle();
     res.json({ success: !!data });
   } catch (e) {
@@ -3276,33 +3348,54 @@ async function getWalletBalance(email, userType) {
   return data ? parseFloat(data.wallet_balance) || 0 : 0;
 }
 
-// Helper: update wallet balance and log transaction
+// Helper: update wallet balance and log transaction.
+// Uses compare-and-swap (conditional update on the balance we read) with a
+// bounded retry loop so concurrent requests against the same wallet can't
+// race past each other and corrupt the balance.
 async function updateWallet(email, userType, type, amount, reference, description) {
   const table = walletTable(userType);
-  const balanceBefore = await getWalletBalance(email, userType);
   const delta = ["deposit", "refund", "admin_credit"].includes(type) ? amount : -amount;
-  const balanceAfter = Math.round((balanceBefore + delta) * 100) / 100;
 
-  const { error: updateError } = await supabase
-    .from(table)
-    .update({ wallet_balance: balanceAfter })
-    .eq("email", email);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const balanceBefore = await getWalletBalance(email, userType);
+    const balanceAfter = Math.round((balanceBefore + delta) * 100) / 100;
 
-  if (updateError) throw updateError;
+    if (balanceAfter < 0) {
+      const err = new Error("Insufficient wallet balance.");
+      err.code = "INSUFFICIENT_BALANCE";
+      throw err;
+    }
 
-  const { error: logError } = await supabase.from("wallet_transactions").insert({
-    user_email: email,
-    user_type: userType,
-    type,
-    amount: Math.abs(amount),
-    balance_before: balanceBefore,
-    balance_after: balanceAfter,
-    reference: reference || null,
-    description: description || ""
-  });
+    const { data: updated, error: updateError } = await supabase
+      .from(table)
+      .update({ wallet_balance: balanceAfter })
+      .eq("email", email)
+      .eq("wallet_balance", balanceBefore)
+      .select("wallet_balance");
 
-  if (logError) throw logError;
-  return { balanceBefore, balanceAfter };
+    if (updateError) throw updateError;
+
+    if (updated && updated.length > 0) {
+      const { error: logError } = await supabase.from("wallet_transactions").insert({
+        user_email: email,
+        user_type: userType,
+        type,
+        amount: Math.abs(amount),
+        balance_before: balanceBefore,
+        balance_after: balanceAfter,
+        reference: reference || null,
+        description: description || ""
+      });
+
+      if (logError) throw logError;
+      return { balanceBefore, balanceAfter };
+    }
+    // Balance changed under us since we read it — retry with a fresh read.
+  }
+
+  const err = new Error("Could not update wallet balance due to a concurrent update. Please try again.");
+  err.code = "WALLET_CONTENTION";
+  throw err;
 }
 
 // ── GET /wallet/balance ──
@@ -3445,11 +3538,25 @@ app.post("/wallet/withdraw", async (req, res) => {
     const userType = await resolveUserType(email);
     if (!userType) return res.status(404).json({ success: false, message: "User not found." });
 
-    const balance = await getWalletBalance(email, userType);
-    if (amount > balance) return res.status(400).json({ success: false, message: "Insufficient balance." });
     if (amount < 10) return res.status(400).json({ success: false, message: "Minimum withdrawal is GHS 10." });
 
-    // Create withdrawal request (balance stays intact until admin approves)
+    // Reserve the funds immediately (atomic deduct) so multiple pending
+    // requests can't jointly overdraw the wallet before an admin gets to
+    // approve them. Rejection refunds this amount back.
+    let walletResult;
+    try {
+      walletResult = await updateWallet(email, userType, "withdrawal_hold", amount, null, "Withdrawal request submitted");
+    } catch (walletErr) {
+      if (walletErr.code === "INSUFFICIENT_BALANCE") {
+        return res.status(400).json({ success: false, message: "Insufficient balance." });
+      }
+      if (walletErr.code === "WALLET_CONTENTION") {
+        return res.status(400).json({ success: false, message: "Wallet balance changed. Please try again." });
+      }
+      throw walletErr;
+    }
+
+    // Create withdrawal request (funds are already held from the wallet balance above)
     const { data: request, error } = await supabase.from("withdrawal_requests").insert({
       user_email: email,
       user_type: userType,
@@ -3462,7 +3569,11 @@ app.post("/wallet/withdraw", async (req, res) => {
       status: "pending"
     }).select().single();
 
-    if (error) throw error;
+    if (error) {
+      // Refund the hold since the request record failed to save
+      await updateWallet(email, userType, "refund", amount, null, "Refund: withdrawal request failed to save");
+      throw error;
+    }
 
     // Notify admin
     const adminEmails = ADMINS.join(",");
@@ -3519,12 +3630,13 @@ app.post("/admin/wallet/withdraw/:id/:action", async (req, res) => {
     if (wd.status !== "pending") return res.json({ success: true, message: `Already ${wd.status}.` });
 
     if (action === "approve") {
-      // Deduct from wallet and mark completed
-      await updateWallet(wd.user_email, wd.user_type, "withdrawal", wd.amount, null, "Withdrawal approved");
+      // Funds were already deducted (held) when the request was created — just mark it processed.
       await supabase.from("withdrawal_requests").update({
         status: "approved", processed_at: new Date().toISOString(), processed_by: user.email
       }).eq("id", id);
     } else {
+      // Refund the held amount back to the wallet
+      await updateWallet(wd.user_email, wd.user_type, "refund", wd.amount, null, "Withdrawal rejected — refunded");
       await supabase.from("withdrawal_requests").update({
         status: "rejected", processed_at: new Date().toISOString(), processed_by: user.email
       }).eq("id", id);
@@ -3534,8 +3646,8 @@ app.post("/admin/wallet/withdraw/:id/:action", async (req, res) => {
       user_email: wd.user_email,
       title: `Withdrawal ${action === "approve" ? "approved" : "rejected"}`,
       message: action === "approve"
-        ? `Your withdrawal of GHS ${wd.amount} has been approved and deducted from your wallet.`
-        : `Your withdrawal of GHS ${wd.amount} has been rejected.`,
+        ? `Your withdrawal of GHS ${wd.amount} has been approved and will be paid out.`
+        : `Your withdrawal of GHS ${wd.amount} has been rejected and refunded to your wallet.`,
       type: action === "approve" ? "success" : "info"
     });
 
@@ -4837,8 +4949,12 @@ app.put("/settings/admin", async (req, res) => {
   }
 });
 
-// ── Send email notification ──
+// ── Send email notification (admin-only: relays arbitrary HTML from our verified sending domain) ──
 app.post("/notifications/send-email", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+  if (!rateLimitRoute(req, res, 20)) return;
   try {
     const { to, subject, body } = req.body;
     if (!to || !subject || !body) {
