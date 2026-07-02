@@ -450,8 +450,8 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
   async function tryApiUrl(url) {
     return new Promise(resolve => {
       const client = url.startsWith("https") ? https : http;
-      client.get(url, {
-        timeout: 4000,
+      const req = client.get(url, {
+        timeout: 2000,
         headers: {
           "Accept": "application/json, text/plain, */*",
           "User-Agent": "Mozilla/5.0 (compatible; CoverCareAfrica/1.0)"
@@ -463,7 +463,9 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
           try { resolve({ status: resp.statusCode, body: JSON.parse(data) }); }
           catch { resolve({ status: resp.statusCode, body: data }); }
         });
-      }).on("error", () => resolve(null));
+      });
+      req.on("error", () => resolve(null));
+      req.on("timeout", () => { req.destroy(); resolve(null); });
     });
   }
 
@@ -476,12 +478,13 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
     `https://forms.pcghana.org/api/public/search?number=${encodeURIComponent(registration_number)}`
   ];
 
-  for (const url of apiCandidates) {
-    const apiResp = await tryApiUrl(url);
+  // Run all API probes in parallel — max ~2s total
+  const apiResults = await Promise.all(apiCandidates.map(tryApiUrl));
+  for (const apiResp of apiResults) {
     if (!apiResp || apiResp.status >= 500) continue;
     const bodyStr = typeof apiResp.body === "object" ? JSON.stringify(apiResp.body).toLowerCase() : String(apiResp.body).toLowerCase();
     if (bodyStr.includes(registration_number.toLowerCase()) || bodyStr.includes(firstName) || bodyStr.includes(lastName)) {
-      log("info", "PC Ghana API hit", { url, status: apiResp.status, body: bodyStr.substring(0, 500) });
+      log("info", "PC Ghana API hit", { url: "matched", status: apiResp.status, body: bodyStr.substring(0, 500) });
       const nameInResponse = bodyStr.includes(firstName) || bodyStr.includes(lastName);
       if (nameInResponse) {
         return res.json({
