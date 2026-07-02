@@ -441,73 +441,197 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
   const nameParts = name.toLowerCase().trim().split(/\s+/);
   const firstName = nameParts[0] || "";
   const lastName = nameParts[nameParts.length - 1] || "";
+
+  // ── Strategy A: Try direct HTTP API calls (lighter, faster) ──
+  // The PC Ghana SPA likely calls a JSON API — probe common endpoint patterns.
+  const https = require("https");
+  const http = require("http");
+
+  async function tryApiUrl(url) {
+    return new Promise(resolve => {
+      const client = url.startsWith("https") ? https : http;
+      client.get(url, {
+        timeout: 4000,
+        headers: {
+          "Accept": "application/json, text/plain, */*",
+          "User-Agent": "Mozilla/5.0 (compatible; CoverCareAfrica/1.0)"
+        }
+      }, resp => {
+        let data = "";
+        resp.on("data", chunk => data += chunk);
+        resp.on("end", () => {
+          try { resolve({ status: resp.statusCode, body: JSON.parse(data) }); }
+          catch { resolve({ status: resp.statusCode, body: data }); }
+        });
+      }).on("error", () => resolve(null));
+    });
+  }
+
+  const apiCandidates = [
+    `https://forms.pcghana.org/api/search?registration=${encodeURIComponent(registration_number)}`,
+    `https://forms.pcghana.org/api/v1/pharmacists/${encodeURIComponent(registration_number)}`,
+    `https://forms.pcghana.org/api/pharmacists/search/${encodeURIComponent(registration_number)}`,
+    `https://forms.pcghana.org/api/search?q=${encodeURIComponent(registration_number)}`,
+    `https://forms.pcghana.org/search?registration_number=${encodeURIComponent(registration_number)}`,
+    `https://forms.pcghana.org/api/public/search?number=${encodeURIComponent(registration_number)}`
+  ];
+
+  for (const url of apiCandidates) {
+    const apiResp = await tryApiUrl(url);
+    if (!apiResp || apiResp.status >= 500) continue;
+    const bodyStr = typeof apiResp.body === "object" ? JSON.stringify(apiResp.body).toLowerCase() : String(apiResp.body).toLowerCase();
+    if (bodyStr.includes(registration_number.toLowerCase()) || bodyStr.includes(firstName) || bodyStr.includes(lastName)) {
+      log("info", "PC Ghana API hit", { url, status: apiResp.status, body: bodyStr.substring(0, 500) });
+      const nameInResponse = bodyStr.includes(firstName) || bodyStr.includes(lastName);
+      if (nameInResponse) {
+        return res.json({
+          success: true,
+          message: "License verified in good standing with the relevant regulatory body.",
+          data: { status: "verified_good", registration_number, name_verified: name }
+        });
+      }
+      return res.json({
+        success: false,
+        message: "Registration number found but name does not match regulatory records.",
+        data: { status: "name_mismatch", registration_number }
+      });
+    }
+  }
+
+  log("info", "PC Ghana direct API calls all missed — falling back to Puppeteer");
+
+  // ── Strategy B: Puppeteer browser scraping ──
   let page;
   let browser;
-
   try {
     browser = await browserPool.getBrowser();
     page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+
+    // Intercept network requests to find the API
+    const capturedUrls = [];
+    page.on("request", request => {
+      const url = request.url();
+      if (url.includes("api") || url.includes("search") || url.includes("pharmacist")) {
+        capturedUrls.push(url);
+      }
+    });
 
     await page.goto("https://forms.pcghana.org/#/search", {
       waitUntil: "networkidle2",
-      timeout: 20000
+      timeout: 25000
     });
 
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await page.waitForSelector("select", { timeout: 10000 });
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
-    const options = await page.evaluate(() => {
-      const select = document.querySelector("select");
-      if (!select) return [];
-      return Array.from(select.options).map(o => ({ value: o.value, text: o.text }));
-    });
+    const pageUrl = page.url();
+    const pageTitle = await page.title();
+    log("info", "PC Ghana page loaded", { url: pageUrl, title: pageTitle });
+    log("info", "PC Ghana API calls captured", { urls: capturedUrls });
 
-    const pharmacistOption = options.find(o => o.text.toLowerCase().includes("pharmacist"));
-    if (pharmacistOption) {
-      await page.select("select", pharmacistOption.value);
+    // If we captured API calls during page load, try them directly with
+    // the registration number next time (cache in a global for now)
+    if (capturedUrls.length > 0) {
+      // Try the first captured API URL with the registration number
+      for (const apiUrl of capturedUrls) {
+        try {
+          const resp = await page.evaluate(async (url) => {
+            const r = await fetch(url);
+            return r.ok ? await r.text() : null;
+          }, apiUrl);
+          if (resp) {
+            log("info", "API response via fetch", { url: apiUrl, body: resp.substring(0, 500) });
+          }
+        } catch (_) {}
+      }
     }
 
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Find select elements
+    await page.waitForSelector("select", { timeout: 12000 }).catch(() => {});
+    const allSelects = await page.evaluate(() => {
+      const selects = document.querySelectorAll("select");
+      return Array.from(selects).map((s, i) => ({
+        index: i,
+        options: Array.from(s.options).map(o => ({ value: o.value, text: o.text }))
+      }));
+    });
+    log("info", "PC Ghana selects", { count: allSelects.length, details: JSON.stringify(allSelects).substring(0, 500) });
 
-    // Find the search input — try text type first, then search type
-    const inputEl = await page.evaluate(() => {
-      const inputs = document.querySelectorAll("input");
+    // Select pharmacist option
+    let professionSelected = false;
+    for (const sel of allSelects) {
+      const pharmOpt = sel.options.find(o => o.text.toLowerCase().includes("pharmacist"));
+      if (pharmOpt) {
+        await page.evaluate(({ idx, val }) => {
+          const s = document.querySelectorAll("select")[idx];
+          if (s) { s.value = val; s.dispatchEvent(new Event("change", { bubbles: true })); }
+        }, { idx: sel.index, val: pharmOpt.value });
+        professionSelected = true;
+        log("info", "Selected pharmacist option", { idx: sel.index, val: pharmOpt.value });
+        break;
+      }
+    }
+
+    if (!professionSelected) {
+      log("warn", "Pharmacist option not found in any select");
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Find and fill the search input
+    const inputSel = await page.evaluate(() => {
+      const inputs = document.querySelectorAll("input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio'])");
       for (const inp of inputs) {
-        if (inp.type === "text" || inp.type === "search") return true;
+        if (inp.offsetParent !== null) {
+          return { id: inp.id, name: inp.name, type: inp.type };
+        }
+      }
+      return null;
+    });
+
+    if (!inputSel) {
+      throw new Error("No visible input found on PC Ghana page");
+    }
+
+    const selStr = inputSel.id ? `#${CSS.escape(inputSel.id)}` : `input[name="${inputSel.name}"]`;
+    await page.waitForSelector(selStr, { timeout: 5000 });
+    await page.click(selStr, { clickCount: 3 });
+    await page.type(selStr, registration_number);
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Try to submit — look for a search button first, then Enter
+    const btnClicked = await page.evaluate(() => {
+      const btns = document.querySelectorAll("button, input[type='submit']");
+      for (const b of btns) {
+        const t = (b.textContent || b.value || "").toLowerCase().trim();
+        if (t.includes("search") || t.includes("find") || t.includes("go") || t.includes("submit") || t === "" || t === "ok") {
+          b.click(); return true;
+        }
       }
       return false;
     });
 
-    if (!inputEl) {
-      throw new Error("Search input not found on page");
+    if (!btnClicked) {
+      await page.keyboard.press("Enter");
     }
 
-    const selector = "input[type='text'], input[type='search']";
-    await page.waitForSelector(selector, { timeout: 8000 });
-    await page.click(selector, { clickCount: 3 });
-    await page.type(selector, registration_number);
-    await page.keyboard.press("Enter");
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    await new Promise(resolve => setTimeout(resolve, 8000));
 
+    // Read the results
     const bodyText = await page.evaluate(() => document.body.innerText);
     const resultText = bodyText.toLowerCase();
 
-    log("info", "PC Ghana response snippet", { snippet: bodyText.substring(0, 600) });
+    log("info", "PC Ghana search result", { text: bodyText.substring(0, 2000) });
 
-    // Detect "no results" messages
-    const noResultsPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no matching"];
-    const showsNoResults = noResultsPhrases.some(p => resultText.includes(p));
+    // Parse the results
+    const noResultPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no entries", "no data", "there are no"];
+    const showsNoResults = noResultPhrases.some(p => resultText.includes(p));
+    const hasRegPattern = /\b[A-Za-z]{2,}\s*\d{3,}\b/.test(resultText);
+    const hasDigits = /\b\d{3,}\b/.test(resultText);
+    const nameFound = resultText.includes(firstName) || resultText.includes(lastName);
+    const hasData = (hasRegPattern || hasDigits) && !showsNoResults;
 
-    // Detect if any data rows were returned (look for registration-like patterns)
-    const hasDataRows = /\b\d{3,}\b/.test(resultText);
-
-    // Check if name appears in the text
-    const nameFound = (firstName.length > 2 && resultText.includes(firstName)) ||
-                      (lastName.length > 2 && resultText.includes(lastName));
-
-    log("info", "Verification parsed", { showsNoResults, hasDataRows, nameFound });
-
-    if (!showsNoResults && hasDataRows && nameFound) {
+    if (hasData && nameFound) {
       return res.json({
         success: true,
         message: "License verified in good standing with the relevant regulatory body.",
@@ -515,7 +639,7 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
       });
     }
 
-    if (!showsNoResults && hasDataRows && !nameFound) {
+    if (hasData && !nameFound) {
       return res.json({
         success: false,
         message: "Registration number found but name does not match regulatory records. Check that your full name matches exactly as registered with your professional body.",
@@ -530,15 +654,7 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
     });
 
   } catch (err) {
-    log("error", "Verification error", { error: err.message });
-
-    // Kill the browser instance so the next request gets a fresh one
-    try {
-      if (browserPool.instance) {
-        await browserPool.instance.close().catch(() => {});
-        browserPool.instance = null;
-      }
-    } catch (_) {}
+    log("error", "PC Ghana Puppeteer error", { error: err.message, stack: err.stack?.substring(0, 500) });
 
     return res.json({
       success: false,
