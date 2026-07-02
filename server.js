@@ -16,6 +16,52 @@ const ADMINS = (process.env.ADMIN_EMAILS || "sdenyoh-abayateye@st.ug.edu.gh")
   .split(",")
   .map(e => e.trim().toLowerCase());
 
+// ── License verification receipts ──
+// /verify performs a real, server-side lookup against the professional
+// regulator (e.g. PC Ghana) and, on a genuine match, signs a short-lived
+// receipt binding {registration_number, name, country, role}. /worker signup
+// requires and validates this receipt before auto-setting license_verified —
+// so the client can prove a real check happened, but can't just assert it.
+const LICENSE_VERIFY_SECRET = process.env.LICENSE_VERIFY_SECRET || process.env.SUPABASE_SECRET_KEY || "dev-only-insecure-secret";
+const LICENSE_VERIFY_TOKEN_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function normalizeForMatch(str) {
+  return (str || "").toString().trim().toLowerCase();
+}
+
+function signLicenseVerification(payload) {
+  const json = JSON.stringify(payload);
+  const encoded = Buffer.from(json).toString("base64url");
+  const signature = crypto.createHmac("sha256", LICENSE_VERIFY_SECRET).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyLicenseVerificationToken(token, { registration_number, name, country, role }) {
+  if (!token || typeof token !== "string") return false;
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [encoded, signature] = parts;
+
+  const expectedSignature = crypto.createHmac("sha256", LICENSE_VERIFY_SECRET).update(encoded).digest("base64url");
+  const sigBuf = Buffer.from(signature);
+  const expBuf = Buffer.from(expectedSignature);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return false;
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    return false;
+  }
+
+  if (Date.now() - payload.iat > LICENSE_VERIFY_TOKEN_TTL_MS) return false;
+  if (normalizeForMatch(payload.registration_number) !== normalizeForMatch(registration_number)) return false;
+  if (normalizeForMatch(payload.name) !== normalizeForMatch(name)) return false;
+  if (normalizeForMatch(payload.country) !== normalizeForMatch(country)) return false;
+  if (normalizeForMatch(payload.role) !== normalizeForMatch(role)) return false;
+  return true;
+}
+
 app.use(cors({
   origin: [
     "https://covercare-africa.vercel.app",
@@ -77,7 +123,7 @@ function log(level, message, data = {}) {
 const browserPool = {
   instance: null,
   async getBrowser() {
-    if (!this.instance || !this.instance.isConnected()) {
+    if (!this.instance || !this.instance.connected) {
       this.instance = await puppeteer.launch({
         headless: true,
         args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -307,7 +353,7 @@ app.post("/worker", async (req, res) => {
     if (typeof body[key] === "string") body[key] = sanitize(body[key]);
   });
 
-  const { full_name, email, phone, role, license_number, city, country, experience, profile_photo_url, bio, license_file_url } = body;
+  const { full_name, email, phone, role, license_number, city, country, experience, profile_photo_url, bio, license_file_url, license_verification_token } = body;
 
   if (!full_name || !email || !phone || !role || !city) {
     return res.status(400).json({ success: false, message: "full_name, email, phone, role, and city are required." });
@@ -317,10 +363,17 @@ app.post("/worker", async (req, res) => {
     return res.status(403).json({ success: false, message: "Email does not match your authenticated account." });
   }
 
+  // license_verified is never taken directly from client input. It's only set
+  // to true here if the client presents a signed receipt proving /verify
+  // actually confirmed this exact registration_number + name + country + role
+  // against the regulator moments earlier. Otherwise it starts false and can
+  // only be flipped later by an admin via /admin/toggle-license.
+  const licenseAutoVerified = license_number && verifyLicenseVerificationToken(license_verification_token, {
+    registration_number: license_number, name: full_name, country, role
+  });
+
   const insertData = {
-    // license_verified is never taken from client input — it can only be set
-    // by an admin via /admin/toggle-license, so a new worker always starts unverified.
-    full_name, email, phone, role, license_number, license_verified: false, city, country, experience, bio
+    full_name, email, phone, role, license_number, license_verified: !!licenseAutoVerified, city, country, experience, bio
   };
   if (profile_photo_url) insertData.profile_photo_url = profile_photo_url;
   if (license_file_url) insertData.license_file_url = license_file_url;
@@ -434,7 +487,7 @@ app.get("/verify", async (req, res) => {
 
   // Currently only auto-verify for Ghana pharmacists
   if (country === "GH" && role === "pharmacist") {
-    return await verifyGhanaPharmacist(req, res, registration_number, name);
+    return await verifyGhanaPharmacist(req, res, registration_number, name, country, role);
   }
 
   return res.json({
@@ -444,7 +497,7 @@ app.get("/verify", async (req, res) => {
   });
 });
 
-async function verifyGhanaPharmacist(req, res, registration_number, name) {
+async function verifyGhanaPharmacist(req, res, registration_number, name, country, role) {
   const nameParts = name.toLowerCase().trim().split(/\s+/);
   const firstName = nameParts[0] || "";
   const lastName = nameParts[nameParts.length - 1] || "";
@@ -494,10 +547,11 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
       log("info", "PC Ghana API hit", { url: "matched", status: apiResp.status, body: bodyStr.substring(0, 500) });
       const nameInResponse = bodyStr.includes(firstName) || bodyStr.includes(lastName);
       if (nameInResponse) {
+        const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
         return res.json({
           success: true,
           message: "License verified in good standing with the relevant regulatory body.",
-          data: { status: "verified_good", registration_number, name_verified: name }
+          data: { status: "verified_good", registration_number, name_verified: name, verification_token }
         });
       }
       return res.json({
@@ -620,10 +674,11 @@ async function verifyGhanaPharmacist(req, res, registration_number, name) {
         const hasData = (hasRegPattern || hasDigits) && !showsNoResults;
 
         if (hasData && nameFound) {
+          const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
           resolve({
             success: true,
             message: "License verified in good standing with the relevant regulatory body.",
-            data: { status: "verified_good", registration_number, name_verified: name }
+            data: { status: "verified_good", registration_number, name_verified: name, verification_token }
           });
           clearTimeout(timer);
           return;
