@@ -1909,6 +1909,45 @@ app.get("/admin/facility/:id", async (req, res) => {
   }
 });
 
+// ── Admin: get full client detail ──
+app.get("/admin/client/:id", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const { data: client, error } = await supabase
+      .from("clients")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error || !client) {
+      return res.status(404).json({ success: false, message: "Client not found." });
+    }
+
+    // Get shift stats (shifts posted by this client via contact_email)
+    const { data: shifts } = await supabase
+      .from("shifts")
+      .select("*")
+      .eq("contact_email", client.email);
+
+    const shiftStats = {
+      total: (shifts || []).length,
+      completed: (shifts || []).filter(s => s.status === "completed").length,
+      in_progress: (shifts || []).filter(s => s.status === "in_progress").length,
+      open: (shifts || []).filter(s => s.status === "open").length,
+      cancelled: (shifts || []).filter(s => s.status === "cancelled").length,
+      total_spend: (shifts || []).reduce((sum, s) => sum + parsePayAmount(s.total_pay) * 1.25, 0)
+    };
+
+    return res.json({ success: true, client, shiftStats });
+  } catch (err) {
+    log("error", "Admin client detail error", { error: err.message });
+    return res.status(500).json({ success: false, message: "Failed to load client details." });
+  }
+});
+
 // ── Admin: toggle facility billing model ──
 app.post("/admin/toggle-billing", async (req, res) => {
   const user = await requireAuth(req, res);
@@ -2008,8 +2047,16 @@ app.post("/admin/reset-account", async (req, res) => {
           await supabase.auth.admin.deleteUser(facility.user_id);
         }
       }
+    } else if (type === "client") {
+      const { data: client } = await supabase.from("clients").select("id, user_id").eq("email", email.toLowerCase()).maybeSingle();
+      if (client) {
+        await supabase.from("clients").delete().eq("id", client.id);
+        if (client.user_id) {
+          await supabase.auth.admin.deleteUser(client.user_id);
+        }
+      }
     } else {
-      return res.status(400).json({ success: false, message: "Invalid type. Must be 'worker' or 'facility'." });
+      return res.status(400).json({ success: false, message: "Invalid type. Must be 'worker', 'facility', or 'client'." });
     }
 
     log("info", "Account reset by admin", { email, type, admin: user.email });
