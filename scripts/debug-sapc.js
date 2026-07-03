@@ -35,7 +35,6 @@ async function findControlNearLabel(page, labelKeyword, tagSelector) {
       el.children.length <= 2 && isCloseMatch(el.textContent)
     );
     function resolveSelector(el) {
-      if (el.id) return `#${CSS.escape(el.id)}`;
       el.setAttribute("data-cc-found", "1");
       return '[data-cc-found="1"]';
     }
