@@ -62,21 +62,38 @@ function verifyLicenseVerificationToken(token, { registration_number, name, coun
   return true;
 }
 
+// Allowed origins: production domain always allowed; extra origins via
+// ALLOWED_ORIGINS (comma-separated); localhost dev origins only outside production.
+const PROD_ORIGIN = "https://covercare-africa.vercel.app";
+const DEV_ORIGINS = [
+  "http://localhost:5500", "http://127.0.0.1:5500",
+  "http://localhost:8000", "http://127.0.0.1:8000",
+  "http://localhost:5501", "http://127.0.0.1:5501"
+];
+const EXTRA_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(o => o.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = [PROD_ORIGIN, ...EXTRA_ORIGINS,
+  ...(process.env.NODE_ENV === "production" ? [] : DEV_ORIGINS)];
+
 app.use(cors({
-  origin: [
-    "https://covercare-africa.vercel.app",
-    "http://localhost:5500",
-    "http://127.0.0.1:5500",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "http://localhost:5501",
-    "http://127.0.0.1:5501"
-  ],
+  origin: ALLOWED_ORIGINS,
   methods: ["GET", "POST", "PUT"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 app.use(express.json({ limit: "5mb" }));
+
+// Lightweight health check for uptime monitors and health-gated deploys.
+app.get("/health", (req, res) => res.json({ status: "ok", ts: Date.now() }));
+
+// Global per-IP rate-limit backstop (generous — only stops abuse). Per-route
+// limiters (rateLimitRoute) still apply tighter caps on sensitive endpoints.
+app.use((req, res, next) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  if (!checkRateLimit("global:" + ip, 240, 60000)) {
+    return res.status(429).json({ success: false, message: "Too many requests. Please slow down." });
+  }
+  next();
+});
 
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -118,6 +135,16 @@ function checkRateLimit(ip, maxRequests = 10, windowMs = 60000) {
 
 function log(level, message, data = {}) {
   console.log(JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...data }));
+  // Fire-and-forget alert on errors when a webhook is configured (Slack/Discord-compatible).
+  if (level === "error" && process.env.ALERT_WEBHOOK_URL) {
+    try {
+      fetch(process.env.ALERT_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: `🚨 CoverCare error: ${message}\n${JSON.stringify(data).slice(0, 800)}` })
+      }).catch(() => {});
+    } catch (_) {}
+  }
 }
 
 const browserPool = {
@@ -1345,6 +1372,56 @@ app.post("/shift/accept", async (req, res) => {
     qr_url: qrUrl,
     qr_token: qrToken,
     shift: data
+  });
+});
+
+// Safe check-in view for the qr-arrive page. Replaces direct browser
+// select("*") on shifts/workers (which leaked contact_email/phone/address/
+// payment fields and full worker PII under the public read policy). Token
+// possession is the authorization; returns only render-safe fields and
+// supports every shift status (accepted / in_progress / completed).
+app.get("/shift/checkin-info", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 40)) return;
+
+  const shift_id = sanitize(req.query.shift_id);
+  const worker_id = sanitize(req.query.worker_id);
+  const token = sanitize(req.query.token);
+  if (!shift_id || !worker_id || !token) {
+    return res.status(400).json({ success: false, message: "Missing shift_id, worker_id, or token." });
+  }
+
+  const shift = await getShiftById(shift_id);
+  if (!shift) {
+    return res.status(404).json({ success: false, message: "Shift not found." });
+  }
+  if (shift.worker_id !== worker_id || !shift.qr_token || shift.qr_token !== token) {
+    return res.status(403).json({ success: false, message: "This QR code is invalid or has expired." });
+  }
+
+  const { data: worker } = await supabase
+    .from("workers")
+    .select("id, full_name, role, license_verified, identity_verified")
+    .eq("id", worker_id)
+    .single();
+
+  return res.json({
+    success: true,
+    shift: {
+      id: shift.id,
+      status: shift.status,
+      facility_name: shift.facility_name,
+      role_needed: shift.role_needed,
+      shift_date: shift.shift_date,
+      start_time: shift.start_time,
+      total_pay: shift.total_pay,
+      adjusted_pay: shift.adjusted_pay,
+      late_minutes: shift.late_minutes,
+      arrival_time: shift.arrival_time,
+      completion_time: shift.completion_time
+    },
+    worker: worker || null
   });
 });
 
