@@ -518,9 +518,11 @@ app.get("/verify", async (req, res) => {
 
   log("info", "Verifying license", { registration_number, name, country, role });
 
-  // Currently only auto-verify for Ghana pharmacists
   if (country === "GH" && role === "pharmacist") {
     return await verifyGhanaPharmacist(req, res, registration_number, name, country, role);
+  }
+  if (country === "ZA" && role === "pharmacist") {
+    return await verifySAPharmacist(req, res, registration_number, name, country, role);
   }
 
   return res.json({
@@ -758,6 +760,178 @@ async function verifyGhanaPharmacist(req, res, registration_number, name, countr
     data: { status: "manual_review", registration_number }
   });
 }
+
+// ── South Africa: SAPC register scraper (license format: P + digits, e.g. P48564) ──
+async function verifySAPharmacist(req, res, registration_number, name, country, role) {
+  const nameParts = name.toLowerCase().trim().split(/\s+/);
+  const firstName = nameParts[0] || "";
+  const lastName = nameParts[nameParts.length - 1] || "";
+
+  if (!/^P\s?\d{3,}$/i.test(registration_number.trim())) {
+    return res.json({
+      success: false,
+      message: "SAPC registration numbers start with P followed by digits (e.g. P48564). Please check the number.",
+      data: { status: "invalid_format", registration_number }
+    });
+  }
+
+  let puppeteerTimedOut = false;
+  const PUPPETEER_TIMEOUT = 15000;
+
+  const puppeteerResult = await new Promise(resolve => {
+    const timer = setTimeout(() => {
+      puppeteerTimedOut = true;
+      resolve(null);
+    }, PUPPETEER_TIMEOUT);
+
+    (async () => {
+      let page;
+      let browser;
+      try {
+        browser = await browserPool.getBrowser();
+        page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 800 });
+
+        await page.goto("https://interns.pharma.mm3.co.za/SearchRegister", {
+          waitUntil: "domcontentloaded",
+          timeout: 10000
+        });
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Select the pharmacist register/category if a dropdown is present
+        const allSelects = await page.evaluate(() => {
+          const selects = document.querySelectorAll("select");
+          return Array.from(selects).map((s, i) => ({
+            index: i,
+            options: Array.from(s.options).map(o => ({ value: o.value, text: o.text }))
+          }));
+        });
+        for (const sel of allSelects) {
+          const pharmOpt = sel.options.find(o => o.text.toLowerCase().includes("pharmacist"));
+          if (pharmOpt) {
+            await page.evaluate(({ idx, val }) => {
+              const s = document.querySelectorAll("select")[idx];
+              if (s) { s.value = val; s.dispatchEvent(new Event("change", { bubbles: true })); }
+            }, { idx: sel.index, val: pharmOpt.value });
+            break;
+          }
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Prefer an input whose id/name/placeholder mentions the registration number
+        const inputSel = await page.evaluate(() => {
+          const inputs = Array.from(document.querySelectorAll(
+            "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio'])"
+          )).filter(inp => inp.offsetParent !== null);
+          const preferred = inputs.find(inp =>
+            /reg|number|p.?number|license/i.test(inp.id + " " + inp.name + " " + (inp.placeholder || "")));
+          const chosen = preferred || inputs[0];
+          return chosen ? (chosen.id || chosen.name || "") : "";
+        });
+
+        if (!inputSel) { resolve(null); return; }
+
+        const selStr = `#${CSS.escape(inputSel)}, input[name="${CSS.escape(inputSel)}"]`;
+        await page.type(selStr, registration_number.trim());
+        await new Promise(r => setTimeout(r, 300));
+
+        await page.evaluate(() => {
+          const btns = document.querySelectorAll("button, input[type='submit']");
+          for (const b of btns) {
+            const t = (b.textContent || b.value || "").toLowerCase().trim();
+            if (t.includes("search") || t.includes("find") || t.includes("go") || t === "ok") {
+              b.click(); return;
+            }
+          }
+          const inp = document.querySelector("input:focus");
+          if (inp) {
+            inp.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+            inp.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", bubbles: true }));
+            inp.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
+          }
+        });
+
+        await new Promise(r => setTimeout(r, 6000));
+
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        const resultText = bodyText.toLowerCase();
+
+        log("info", "SAPC search result", { text: bodyText.substring(0, 2000) });
+
+        const noResultPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no entries", "no data", "there are no"];
+        const showsNoResults = noResultPhrases.some(p => resultText.includes(p));
+        const regFound = resultText.includes(registration_number.trim().toLowerCase());
+        const nameFound = resultText.includes(firstName) || resultText.includes(lastName);
+        const hasData = regFound && !showsNoResults;
+
+        if (hasData && nameFound) {
+          const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
+          resolve({
+            success: true,
+            message: "License verified in good standing with the relevant regulatory body.",
+            data: { status: "verified_good", registration_number, name_verified: name, verification_token }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        if (hasData && !nameFound) {
+          resolve({
+            success: false,
+            message: "Registration number found but name does not match regulatory records.",
+            data: { status: "name_mismatch", registration_number }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        resolve({
+          success: false,
+          message: "Registration number not found in regulatory records. Please check again or upload your license document for manual review.",
+          data: { status: "not_found", registration_number }
+        });
+        clearTimeout(timer);
+      } catch (err) {
+        log("error", "SAPC Puppeteer error", { error: err.message, stack: err.stack?.substring(0, 500) });
+        resolve(null);
+      } finally {
+        try { if (page) await page.close(); } catch (_) {}
+        clearTimeout(timer);
+      }
+    })();
+  });
+
+  if (puppeteerTimedOut) {
+    log("warn", "SAPC Puppeteer timed out — falling back to manual review");
+  }
+
+  if (puppeteerResult) {
+    return res.json(puppeteerResult);
+  }
+
+  return res.json({
+    success: false,
+    message: "Auto-verification is temporarily unavailable. Upload your license document for manual review by our team.",
+    data: { status: "manual_review", registration_number }
+  });
+}
+
+// Alias route: same parameters as /verify, always treated as ZA
+app.get("/verify-za", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  if (!checkRateLimit(ip, 5, 60000)) {
+    return res.status(429).json({ success: false, message: "Too many verification requests. Please wait a minute and try again." });
+  }
+  const registration_number = sanitize(req.query.registration_number);
+  const name = sanitize(req.query.name);
+  const role = (req.query.role || "pharmacist").toLowerCase();
+  if (!registration_number || !name) {
+    return res.status(400).json({ success: false, message: "Registration number and name are required." });
+  }
+  return await verifySAPharmacist(req, res, registration_number, name, "ZA", role);
+});
 
 app.post("/verify-identity", async (req, res) => {
   const user = await requireAuth(req, res);
