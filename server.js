@@ -594,207 +594,198 @@ app.get("/verify", async (req, res) => {
   });
 });
 
+// Locates the PCGhana results table by header content (not position — the
+// table's exact HTML structure/classes can change; the column labels shown
+// to users are the stable contract) and returns { headers, rows } as plain
+// objects keyed by cleaned header text (lowercased, punctuation/footnote
+// markers like "Registration Number¹" stripped). Returns null if no
+// matching table is present yet (still loading) or ever (site changed).
+async function pcGhanaExtractTable(page) {
+  return await page.evaluate(() => {
+    const cleanHeader = (h) => (h || "").toLowerCase().replace(/[^a-z]+/g, " ").trim();
+    const tables = Array.from(document.querySelectorAll("table"));
+    for (const t of tables) {
+      const headerCells = Array.from(t.querySelectorAll("th")).map(th => cleanHeader(th.textContent));
+      const hasRegNumber = headerCells.some(h => h.includes("registration number"));
+      const hasName = headerCells.some(h => h.includes("last name")) || headerCells.some(h => h.includes("first name"));
+      if (!hasRegNumber || !hasName) continue;
+
+      const rows = Array.from(t.querySelectorAll("tbody tr")).map(tr => {
+        const cells = Array.from(tr.querySelectorAll("td")).map(td => td.textContent.trim());
+        const row = {};
+        headerCells.forEach((h, i) => { row[h] = cells[i] || ""; });
+        return row;
+      }).filter(r => Object.values(r).some(v => v));
+
+      return { headers: headerCells, rows };
+    }
+    return null;
+  });
+}
+
+// Waits until either the results table has rows, an explicit "no results"
+// message appears, or the timeout elapses — replaces fixed sleeps, which
+// broke as soon as the site's load time changed even slightly.
+async function pcGhanaWaitForResults(page, timeoutMs) {
+  await page.waitForFunction(
+    () => {
+      const hasTableRows = Array.from(document.querySelectorAll("table")).some(t => t.querySelectorAll("tbody tr").length > 0);
+      const bodyText = (document.body.innerText || "").toLowerCase();
+      const noResults = /no result|not found|no record|no entries|no data|there are no/.test(bodyText);
+      return hasTableRows || noResults;
+    },
+    { timeout: timeoutMs }
+  ).catch(() => {});
+}
+
+// Drives the actual search form as a fallback for when deep-linking (see
+// below) doesn't auto-populate results — selects "Pharmacists" in the
+// register dropdown, types the registration number, clicks Search.
+async function pcGhanaSearchViaForm(page, registrationNumber) {
+  await page.waitForSelector("select", { timeout: 8000 }).catch(() => {});
+
+  await page.evaluate(() => {
+    const selects = Array.from(document.querySelectorAll("select"));
+    for (const s of selects) {
+      const opt = Array.from(s.options).find(o => /pharmacists?\b/i.test(o.text) && !/pharmacy/i.test(o.text));
+      if (opt) {
+        s.value = opt.value;
+        s.dispatchEvent(new Event("change", { bubbles: true }));
+        return;
+      }
+    }
+  });
+
+  // Mark the visible text input so we can hand Puppeteer a real selector to
+  // click/type into (real keystrokes are far more reliable against
+  // framework-bound inputs than setting .value directly).
+  const inputSelector = await page.evaluate(() => {
+    const inputs = Array.from(document.querySelectorAll("input")).filter(i =>
+      !["hidden", "checkbox", "radio", "submit", "button"].includes(i.type) && i.offsetParent !== null
+    );
+    const input = inputs[0];
+    if (!input) return null;
+    if (!input.id) input.setAttribute("data-cc-target", "1");
+    return input.id ? `#${CSS.escape(input.id)}` : 'input[data-cc-target="1"]';
+  });
+
+  if (!inputSelector) return null;
+
+  await page.click(inputSelector, { clickCount: 3 }).catch(() => {});
+  await page.type(inputSelector, registrationNumber, { delay: 15 }).catch(() => {});
+
+  await page.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll("button, input[type='submit']"));
+    const btn = btns.find(b => /search/i.test((b.textContent || b.value || "").trim()));
+    if (btn) btn.click();
+  });
+
+  await pcGhanaWaitForResults(page, 8000);
+  return await pcGhanaExtractTable(page);
+}
+
 async function verifyGhanaPharmacist(req, res, registration_number, name, country, role) {
-  const nameParts = name.toLowerCase().trim().split(/\s+/);
+  const nameParts = name.toLowerCase().trim().split(/\s+/).filter(Boolean);
   const firstName = nameParts[0] || "";
   const lastName = nameParts[nameParts.length - 1] || "";
+  const regNormalized = registration_number.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-  // ── Strategy A: Try direct HTTP API calls (lighter, faster) ──
-  // The PC Ghana SPA likely calls a JSON API — probe common endpoint patterns.
-  const https = require("https");
-  const http = require("http");
+  const PUPPETEER_TIMEOUT = 20000;
+  let timedOut = false;
 
-  async function tryApiUrl(url) {
-    return new Promise(resolve => {
-      const client = url.startsWith("https") ? https : http;
-      const req = client.get(url, {
-        timeout: 2000,
-        headers: {
-          "Accept": "application/json, text/plain, */*",
-          "User-Agent": "Mozilla/5.0 (compatible; CoverCareAfrica/1.0)"
-        }
-      }, resp => {
-        let data = "";
-        resp.on("data", chunk => data += chunk);
-        resp.on("end", () => {
-          try { resolve({ status: resp.statusCode, body: JSON.parse(data) }); }
-          catch { resolve({ status: resp.statusCode, body: data }); }
-        });
-      });
-      req.on("error", () => resolve(null));
-      req.on("timeout", () => { req.destroy(); resolve(null); });
-    });
-  }
-
-  const apiCandidates = [
-    `https://forms.pcghana.org/api/search?registration=${encodeURIComponent(registration_number)}`,
-    `https://forms.pcghana.org/api/v1/pharmacists/${encodeURIComponent(registration_number)}`,
-    `https://forms.pcghana.org/api/pharmacists/search/${encodeURIComponent(registration_number)}`,
-    `https://forms.pcghana.org/api/search?q=${encodeURIComponent(registration_number)}`,
-    `https://forms.pcghana.org/search?registration_number=${encodeURIComponent(registration_number)}`,
-    `https://forms.pcghana.org/api/public/search?number=${encodeURIComponent(registration_number)}`
-  ];
-
-  // Run all API probes in parallel — max ~2s total
-  const apiResults = await Promise.all(apiCandidates.map(tryApiUrl));
-  for (const apiResp of apiResults) {
-    if (!apiResp || apiResp.status >= 500) continue;
-    const bodyStr = typeof apiResp.body === "object" ? JSON.stringify(apiResp.body).toLowerCase() : String(apiResp.body).toLowerCase();
-    if (bodyStr.includes(registration_number.toLowerCase()) || bodyStr.includes(firstName) || bodyStr.includes(lastName)) {
-      log("info", "PC Ghana API hit", { url: "matched", status: apiResp.status, body: bodyStr.substring(0, 500) });
-      const nameInResponse = bodyStr.includes(firstName) || bodyStr.includes(lastName);
-      if (nameInResponse) {
-        const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
-        return res.json({
-          success: true,
-          message: "License verified in good standing with the relevant regulatory body.",
-          data: { status: "verified_good", registration_number, name_verified: name, verification_token }
-        });
-      }
-      return res.json({
-        success: false,
-        message: "Registration number found but name does not match regulatory records.",
-        data: { status: "name_mismatch", registration_number }
-      });
-    }
-  }
-
-  log("info", "PC Ghana direct API calls all missed — falling back to Puppeteer (with 12s timeout)");
-
-  // ── Strategy B: Puppeteer browser scraping (with hard timeout) ──
-  // Puppeteer/Chromium is unreliable on Railway free tier, so we wrap
-  // the entire flow in a timeout to avoid hanging the response.
-  let puppeteerTimedOut = false;
-  const PUPPETEER_TIMEOUT = 12000;
-
-  const puppeteerResult = await new Promise(resolve => {
-    const timer = setTimeout(() => {
-      puppeteerTimedOut = true;
-      resolve(null);
-    }, PUPPETEER_TIMEOUT);
+  const result = await new Promise(resolve => {
+    const timer = setTimeout(() => { timedOut = true; resolve(null); }, PUPPETEER_TIMEOUT);
 
     (async () => {
-      let page;
-      let browser;
+      let page, browser;
       try {
         browser = await browserPool.getBrowser();
         page = await browser.newPage();
-        await page.setViewport({ width: 1280, height: 800 });
+        await page.setViewport({ width: 1280, height: 900 });
+        await page.setUserAgent(
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        );
 
-        await page.goto("https://forms.pcghana.org/#/search", {
-          waitUntil: "domcontentloaded",
-          timeout: 10000
-        });
+        // ── Strategy A: deep-link straight into search results. PCGhana's own
+        // UI produces URLs like #/search?param=X&search_type=Pharmacists&advanced=no
+        // — mirroring that lets the Angular router populate results without
+        // us having to click through the form at all. ──
+        const deepLinkUrl = `https://forms.pcghana.org/#/search?param=${encodeURIComponent(registration_number)}&search_type=Pharmacists&advanced=no&t=${Date.now()}`;
+        await page.goto(deepLinkUrl, { waitUntil: "networkidle2", timeout: 15000 });
+        await pcGhanaWaitForResults(page, 10000);
 
-        await new Promise(r => setTimeout(r, 2000));
+        let table = await pcGhanaExtractTable(page);
 
-        // Try to find select
-        const hasSelect = await page.evaluate(() => !!document.querySelector("select"));
-        if (!hasSelect) {
-          const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 500));
-          log("info", "PC Ghana no select found", { body: bodySnippet });
-          resolve(null); return;
+        // ── Strategy B: the deep link didn't produce a recognizable table —
+        // fall back to driving the form the way a human would. ──
+        if (!table) {
+          log("info", "PC Ghana deep link produced no recognizable table — trying form interaction");
+          table = await pcGhanaSearchViaForm(page, registration_number);
         }
 
-        const allSelects = await page.evaluate(() => {
-          const selects = document.querySelectorAll("select");
-          return Array.from(selects).map((s, i) => ({
-            index: i,
-            options: Array.from(s.options).map(o => ({ value: o.value, text: o.text }))
-          }));
-        });
-
-        // Select pharmacist option
-        for (const sel of allSelects) {
-          const pharmOpt = sel.options.find(o => o.text.toLowerCase().includes("pharmacist"));
-          if (pharmOpt) {
-            await page.evaluate(({ idx, val }) => {
-              const s = document.querySelectorAll("select")[idx];
-              if (s) { s.value = val; s.dispatchEvent(new Event("change", { bubbles: true })); }
-            }, { idx: sel.index, val: pharmOpt.value });
-            break;
-          }
+        if (!table) {
+          const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 1000)).catch(() => "");
+          log("warn", "PC Ghana: no results table found by either strategy — site structure may have changed", { body: bodySnippet });
+          resolve(null);
+          return;
         }
 
-        await new Promise(r => setTimeout(r, 1500));
+        log("info", "PC Ghana table found", { headers: table.headers, rowCount: table.rows.length });
 
-        // Find the first visible input
-        const inputSel = await page.evaluate(() => {
-          const inputs = document.querySelectorAll("input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio'])");
-          for (const inp of inputs) {
-            if (inp.offsetParent !== null) return inp.id || inp.name || "";
-          }
-          return "";
+        const regKey = table.headers.find(h => h.includes("registration number"));
+        const lastKey = table.headers.find(h => h.includes("last name"));
+        const firstKey = table.headers.find(h => h.includes("first name"));
+        const statusKey = table.headers.find(h => h.includes("registration status")) || table.headers.find(h => h.includes("status"));
+
+        const row = table.rows.find(r => {
+          const rowReg = (r[regKey] || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          return rowReg && (rowReg === regNormalized || rowReg.includes(regNormalized) || regNormalized.includes(rowReg));
         });
 
-        if (!inputSel) {
-          resolve(null); return;
-        }
-
-        const selStr = inputSel.startsWith("#") ? `#${CSS.escape(inputSel)}` :
-                       `#${CSS.escape(inputSel)}, input[name="${CSS.escape(inputSel)}"]`;
-
-        await page.type(selStr, registration_number);
-        await new Promise(r => setTimeout(r, 300));
-
-        // Submit
-        await page.evaluate(() => {
-          const btns = document.querySelectorAll("button, input[type='submit']");
-          for (const b of btns) {
-            const t = (b.textContent || b.value || "").toLowerCase().trim();
-            if (t.includes("search") || t.includes("find") || t.includes("go") || t === "ok") {
-              b.click(); return;
-            }
-          }
-          // No button found — press Enter on the focused input
-          const inp = document.querySelector("input:focus");
-          if (inp) {
-            inp.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-            inp.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", bubbles: true }));
-            inp.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
-          }
-        });
-
-        await new Promise(r => setTimeout(r, 6000));
-
-        const bodyText = await page.evaluate(() => document.body.innerText);
-        const resultText = bodyText.toLowerCase();
-
-        log("info", "PC Ghana search result", { text: bodyText.substring(0, 2000) });
-
-        // Parse the results
-        const noResultPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no entries", "no data", "there are no"];
-        const showsNoResults = noResultPhrases.some(p => resultText.includes(p));
-        const hasRegPattern = /\b[A-Za-z]{2,}\s*\d{3,}\b/.test(resultText);
-        const hasDigits = /\b\d{3,}\b/.test(resultText);
-        const nameFound = resultText.includes(firstName) || resultText.includes(lastName);
-        const hasData = (hasRegPattern || hasDigits) && !showsNoResults;
-
-        if (hasData && nameFound) {
-          const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
+        if (!row) {
           resolve({
-            success: true,
-            message: "License verified in good standing with the relevant regulatory body.",
-            data: { status: "verified_good", registration_number, name_verified: name, verification_token }
+            success: false,
+            message: "Registration number not found in Pharmacy Council of Ghana records. Please check the number and try again, or upload your license document for manual review.",
+            data: { status: "not_found", registration_number }
           });
           clearTimeout(timer);
           return;
         }
 
-        if (hasData && !nameFound) {
+        const rowLast = (row[lastKey] || "").toLowerCase();
+        const rowFirst = (row[firstKey] || "").toLowerCase();
+        const nameMatches =
+          (!!rowLast && (rowLast === lastName || rowLast.includes(lastName) || lastName.includes(rowLast))) ||
+          (!!rowFirst && (rowFirst === firstName || rowFirst.includes(firstName) || firstName.includes(rowFirst)));
+
+        if (!nameMatches) {
           resolve({
             success: false,
-            message: "Registration number found but name does not match regulatory records.",
+            message: "Registration number found but the name does not match Pharmacy Council of Ghana records.",
             data: { status: "name_mismatch", registration_number }
           });
           clearTimeout(timer);
           return;
         }
 
+        const statusText = row[statusKey] || "";
+        const goodStanding = /good standing/i.test(statusText);
+
+        if (!goodStanding) {
+          resolve({
+            success: false,
+            message: `Your registration was found, but its current status is "${statusText || "unknown"}" — not in good standing. Please upload your license document for manual review.`,
+            data: { status: "not_good_standing", registration_number, registry_status: statusText }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
         resolve({
-          success: false,
-          message: "Registration number not found in regulatory records. Please check again or upload your license document for manual review.",
-          data: { status: "not_found", registration_number }
+          success: true,
+          message: "License verified in good standing with the Pharmacy Council of Ghana.",
+          data: { status: "verified_good", registration_number, name_verified: name, verification_token }
         });
         clearTimeout(timer);
       } catch (err) {
@@ -807,13 +798,12 @@ async function verifyGhanaPharmacist(req, res, registration_number, name, countr
     })();
   });
 
-  // After Puppeteer (or timeout), handle result
-  if (puppeteerTimedOut) {
+  if (timedOut) {
     log("warn", "PC Ghana Puppeteer timed out — falling back to manual review");
   }
 
-  if (puppeteerResult) {
-    return res.json(puppeteerResult);
+  if (result) {
+    return res.json(result);
   }
 
   return res.json({
