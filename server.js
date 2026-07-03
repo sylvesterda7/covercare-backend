@@ -2698,7 +2698,7 @@ app.get("/shifts/open", async (req, res) => {
   const workerRole = worker ? normalizeWorkerRole(worker.role) : null;
   const workerId = worker?.id || null;
 
-  const SELECT_COLS = "id, facility_name, role_needed, city, shift_date, start_time, duration, duration_hours, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
+  const SELECT_COLS = "id, facility_name, role_needed, city, shift_date, start_time, duration, duration_hours, days_needed, workers_needed, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
 
   let openQuery = supabase.from("shifts").select(SELECT_COLS).eq("status", "open");
   if (workerRole) openQuery = openQuery.eq("role_needed", workerRole);
@@ -2757,6 +2757,8 @@ app.get("/shifts/open", async (req, res) => {
       start_time: s.start_time,
       duration: s.duration,
       duration_hours: s.duration_hours,
+      days_needed: s.days_needed,
+      workers_needed: s.workers_needed,
       pay_rate: s.pay_rate,
       urgency: s.urgency,
       status: s.status,
