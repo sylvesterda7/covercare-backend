@@ -804,13 +804,37 @@ app.post("/payment/initialize", async (req, res) => {
   const wantsPostpaid = req.body.payment_method === "postpaid";
 
   let isTrusted = false;
+  let creditLimit = 0;
   if (wantsPostpaid) {
     const { data: facility } = await supabase
       .from("facilities")
-      .select("billing_model, trusted_by")
+      .select("billing_model, trusted_by, credit_limit")
       .eq("email", email)
       .maybeSingle();
     isTrusted = facility?.billing_model === "postpaid" && facility?.trusted_by;
+    creditLimit = parseFloat(facility?.credit_limit) || 0;
+  }
+
+  // ── Enforce monthly credit limit (0 = no limit set) ──
+  if (wantsPostpaid && isTrusted && creditLimit > 0) {
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
+    const { data: monthShifts } = await supabase
+      .from("shifts")
+      .select("total_pay")
+      .eq("contact_email", email)
+      .eq("payment_status", "postpaid")
+      .gte("created_at", monthStart);
+    const usedCredit = (monthShifts || []).reduce((sum, s) => {
+      return sum + (parseFloat(String(s.total_pay || "").replace(/[^0-9.]/g, "")) || 0) * 1.25;
+    }, 0);
+    if (usedCredit + facilityTotal > creditLimit) {
+      log("info", "Postpaid credit limit exceeded", { email, usedCredit, creditLimit });
+      return res.status(402).json({
+        success: false,
+        credit_limit_exceeded: true,
+        message: `Monthly credit limit reached (GHS ${Math.round(usedCredit).toLocaleString()} of GHS ${creditLimit.toLocaleString()} used). Please pay upfront for this shift, or contact CoverCare to raise your limit.`
+      });
+    }
   }
 
   if (wantsPostpaid && isTrusted) {
@@ -2295,6 +2319,45 @@ app.post("/admin/approve-facility", async (req, res) => {
   return res.json({ success: true, message: "Facility approved for postpaid billing." });
 });
 
+// ── Admin: set monthly credit limit for a trusted facility ──
+app.post("/admin/set-credit-limit", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const email = sanitize(req.body.email);
+  const creditLimit = parseFloat(req.body.credit_limit);
+  if (!email || Number.isNaN(creditLimit) || creditLimit < 0) {
+    return res.status(400).json({ success: false, message: "Facility email and a non-negative credit_limit are required." });
+  }
+
+  const { data: facility } = await supabase
+    .from("facilities")
+    .select("id, billing_model")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (!facility) {
+    return res.status(404).json({ success: false, message: "Facility not found." });
+  }
+  if (facility.billing_model !== "postpaid") {
+    return res.status(400).json({ success: false, message: "Facility must be approved for postpaid billing first." });
+  }
+
+  const { error } = await supabase
+    .from("facilities")
+    .update({ credit_limit: creditLimit })
+    .eq("email", email);
+
+  if (error) {
+    log("error", "Set credit limit error", { error: error.message, email });
+    return res.status(500).json({ success: false, message: "Failed to set credit limit." });
+  }
+
+  log("info", "Credit limit set", { email, creditLimit, admin: user.email });
+  return res.json({ success: true, message: `Credit limit set to GHS ${creditLimit.toLocaleString()}.` });
+});
+
 // ── Admin: revoke postpaid billing ──
 app.post("/admin/revoke-facility", async (req, res) => {
   const user = await requireAuth(req, res);
@@ -2328,7 +2391,7 @@ app.get("/admin/trusted-facilities", async (req, res) => {
 
   const { data: facilities, error: facError } = await supabase
     .from("facilities")
-    .select("id, facility_name, email, city, billing_model, trusted_by, created_at")
+    .select("id, facility_name, email, city, billing_model, trusted_by, credit_limit, created_at")
     .eq("billing_model", "postpaid")
     .order("created_at", { ascending: false });
 
