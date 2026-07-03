@@ -113,8 +113,8 @@ async function dumpDiagnostics(page, label) {
         );
         const input = inputs[0];
         if (!input) return null;
-        if (!input.id) input.setAttribute("data-cc-target", "1");
-        return input.id ? `#${CSS.escape(input.id)}` : 'input[data-cc-target="1"]';
+        input.setAttribute("data-cc-target", "1");
+        return 'input[data-cc-target="1"]';
       });
       console.log(`  Search input selector: ${inputSelector || "NOT FOUND"}`);
 

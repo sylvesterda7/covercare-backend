@@ -658,15 +658,19 @@ async function pcGhanaSearchViaForm(page, registrationNumber) {
 
   // Mark the visible text input so we can hand Puppeteer a real selector to
   // click/type into (real keystrokes are far more reliable against
-  // framework-bound inputs than setting .value directly).
+  // framework-bound inputs than setting .value directly). Always tag with
+  // our own attribute rather than building a selector from the page's own
+  // id — CSS.escape is not implemented in every headless Chromium variant
+  // (e.g. chrome-headless-shell), and we don't need it: we control the
+  // attribute value we set, so it never needs escaping.
   const inputSelector = await page.evaluate(() => {
     const inputs = Array.from(document.querySelectorAll("input")).filter(i =>
       !["hidden", "checkbox", "radio", "submit", "button"].includes(i.type) && i.offsetParent !== null
     );
     const input = inputs[0];
     if (!input) return null;
-    if (!input.id) input.setAttribute("data-cc-target", "1");
-    return input.id ? `#${CSS.escape(input.id)}` : 'input[data-cc-target="1"]';
+    input.setAttribute("data-cc-target", "1");
+    return 'input[data-cc-target="1"]';
   });
 
   if (!inputSelector) return null;
@@ -832,8 +836,12 @@ async function sapcFindControlNearLabel(page, labelKeyword, tagSelector) {
       el.children.length <= 2 && isCloseMatch(el.textContent)
     );
 
+    // Always tag with our own attribute rather than building a selector
+    // from the page's own id — CSS.escape is not implemented in every
+    // headless Chromium variant (e.g. chrome-headless-shell), and we don't
+    // need it: we control the attribute value we set here, so it never
+    // needs escaping.
     function resolveSelector(el) {
-      if (el.id) return `#${CSS.escape(el.id)}`;
       el.setAttribute("data-cc-found", "1");
       return '[data-cc-found="1"]';
     }
