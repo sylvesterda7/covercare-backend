@@ -814,10 +814,117 @@ async function verifyGhanaPharmacist(req, res, registration_number, name, countr
 }
 
 // ── South Africa: SAPC register scraper (license format: P + digits, e.g. P48564) ──
+// Finds a form control (matching tagSelector) whose nearby visible label
+// text matches labelKeyword, and returns a CSS selector for it (tagging the
+// element with a temporary attribute if it has no id). Handles the common
+// label layouts: <label for="id">, a wrapping <label>, and label/control as
+// adjacent table cells or siblings — without assuming exact page markup.
+// Returns null if no confident match is found.
+async function sapcFindControlNearLabel(page, labelKeyword, tagSelector) {
+  return await page.evaluate((keyword, tagSel) => {
+    const kw = keyword.toLowerCase();
+    const isCloseMatch = (text) => {
+      const t = (text || "").trim().toLowerCase();
+      return !!t && (t === kw || (t.includes(kw) && t.length <= kw.length + 15));
+    };
+
+    const candidates = Array.from(document.querySelectorAll("body *")).filter(el =>
+      el.children.length <= 2 && isCloseMatch(el.textContent)
+    );
+
+    function resolveSelector(el) {
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      el.setAttribute("data-cc-found", "1");
+      return '[data-cc-found="1"]';
+    }
+
+    for (const label of candidates) {
+      if (label.tagName === "LABEL" && label.htmlFor) {
+        const el = document.getElementById(label.htmlFor);
+        if (el && el.matches(tagSel)) return resolveSelector(el);
+      }
+      let container = label.closest("label, td, th, div, li, tr, span");
+      for (let hops = 0; container && hops < 4; hops++) {
+        const el = container.matches(tagSel) ? container : container.querySelector(tagSel);
+        if (el) return resolveSelector(el);
+        container = container.nextElementSibling;
+      }
+    }
+    return null;
+  }, labelKeyword, tagSelector);
+}
+
+// Best-effort: find a control near the given label text and select/click
+// it. Used for the "Registered Person" radio, which is already the site's
+// default — this only needs to act if that default ever changes, so a
+// failed lookup here is not fatal to the overall search.
+async function sapcClickControlNearLabel(page, labelKeyword, tagSelector) {
+  const selector = await sapcFindControlNearLabel(page, labelKeyword, tagSelector);
+  if (!selector) return false;
+  try {
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (el) {
+        el.checked = true;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.click();
+      }
+    }, selector);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function sapcWaitForResults(page, timeoutMs) {
+  await page.waitForFunction(
+    () => {
+      const hasTableRows = Array.from(document.querySelectorAll("table")).some(t => t.querySelectorAll("tbody tr").length > 0);
+      const bodyText = (document.body.innerText || "").toLowerCase();
+      const noResults = /no records|0 records|no results|not found|no record|no entries|no data|there are no/.test(bodyText);
+      return hasTableRows || noResults;
+    },
+    { timeout: timeoutMs }
+  ).catch(() => {});
+}
+
+// Locates the SAPC results table by its real column headers (P Number /
+// First Name / Surname / Role / Status / Designation / Province) rather
+// than table position, since that's the stable, user-visible contract.
+async function sapcExtractTable(page) {
+  return await page.evaluate(() => {
+    const cleanHeader = (h) => (h || "").toLowerCase().replace(/[^a-z]+/g, " ").trim();
+    const tables = Array.from(document.querySelectorAll("table"));
+    for (const t of tables) {
+      const headerCells = Array.from(t.querySelectorAll("th")).map(th => cleanHeader(th.textContent));
+      const hasPNumber = headerCells.some(h => h.includes("p number"));
+      const hasNameCol = headerCells.some(h => h.includes("surname")) || headerCells.some(h => h.includes("first name"));
+      if (!hasPNumber || !hasNameCol) continue;
+
+      const rows = Array.from(t.querySelectorAll("tbody tr")).map(tr => {
+        const cells = Array.from(tr.querySelectorAll("td")).map(td => td.textContent.trim());
+        const row = {};
+        headerCells.forEach((h, i) => { row[h] = cells[i] || ""; });
+        return row;
+      }).filter(r => Object.values(r).some(v => v));
+
+      return { headers: headerCells, rows };
+    }
+    return null;
+  });
+}
+
+// ── South Africa: SAPC register scraper ──
+// Unlike PCGhana, this site has no deep-linkable search URL (plain
+// /SearchRegister, no query params reflected in the address bar), so the
+// only reliable path is driving the actual form: confirm "Registered
+// Person" is selected in the "Search For" radio group, type the P number
+// into "Search Text", click "Search".
 async function verifySAPharmacist(req, res, registration_number, name, country, role) {
-  const nameParts = name.toLowerCase().trim().split(/\s+/);
+  const nameParts = name.toLowerCase().trim().split(/\s+/).filter(Boolean);
   const firstName = nameParts[0] || "";
   const lastName = nameParts[nameParts.length - 1] || "";
+  const regNormalized = registration_number.trim().toUpperCase().replace(/\s+/g, "");
 
   if (!/^P\s?\d{3,}$/i.test(registration_number.trim())) {
     return res.json({
@@ -827,122 +934,132 @@ async function verifySAPharmacist(req, res, registration_number, name, country, 
     });
   }
 
-  let puppeteerTimedOut = false;
-  const PUPPETEER_TIMEOUT = 15000;
+  const PUPPETEER_TIMEOUT = 28000;
+  let timedOut = false;
 
-  const puppeteerResult = await new Promise(resolve => {
-    const timer = setTimeout(() => {
-      puppeteerTimedOut = true;
-      resolve(null);
-    }, PUPPETEER_TIMEOUT);
+  const result = await new Promise(resolve => {
+    const timer = setTimeout(() => { timedOut = true; resolve(null); }, PUPPETEER_TIMEOUT);
 
     (async () => {
-      let page;
-      let browser;
+      let page, browser;
       try {
         browser = await browserPool.getBrowser();
         page = await browser.newPage();
-        await page.setViewport({ width: 1280, height: 800 });
+        await page.setViewport({ width: 1280, height: 900 });
+        await page.setUserAgent(
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        );
 
         await page.goto("https://interns.pharma.mm3.co.za/SearchRegister", {
-          waitUntil: "domcontentloaded",
-          timeout: 10000
+          waitUntil: "networkidle2",
+          timeout: 15000
         });
 
-        await new Promise(r => setTimeout(r, 2000));
+        // "Registered Person" is already the site's default — this is a
+        // best-effort correction only, not required for the search to work.
+        await sapcClickControlNearLabel(page, "registered person", 'input[type="radio"]');
 
-        // Select the pharmacist register/category if a dropdown is present
-        const allSelects = await page.evaluate(() => {
-          const selects = document.querySelectorAll("select");
-          return Array.from(selects).map((s, i) => ({
-            index: i,
-            options: Array.from(s.options).map(o => ({ value: o.value, text: o.text }))
-          }));
-        });
-        for (const sel of allSelects) {
-          const pharmOpt = sel.options.find(o => o.text.toLowerCase().includes("pharmacist"));
-          if (pharmOpt) {
-            await page.evaluate(({ idx, val }) => {
-              const s = document.querySelectorAll("select")[idx];
-              if (s) { s.value = val; s.dispatchEvent(new Event("change", { bubbles: true })); }
-            }, { idx: sel.index, val: pharmOpt.value });
-            break;
-          }
+        const searchInputSelector = await sapcFindControlNearLabel(
+          page,
+          "search text",
+          'input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])'
+        );
+
+        if (!searchInputSelector) {
+          const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 1000)).catch(() => "");
+          log("warn", "SAPC: could not locate the Search Text input — site structure may have changed", { body: bodySnippet });
+          resolve(null);
+          return;
         }
 
-        await new Promise(r => setTimeout(r, 1000));
+        await page.click(searchInputSelector, { clickCount: 3 }).catch(() => {});
+        await page.type(searchInputSelector, registration_number.trim(), { delay: 15 }).catch(() => {});
 
-        // Prefer an input whose id/name/placeholder mentions the registration number
-        const inputSel = await page.evaluate(() => {
-          const inputs = Array.from(document.querySelectorAll(
-            "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio'])"
-          )).filter(inp => inp.offsetParent !== null);
-          const preferred = inputs.find(inp =>
-            /reg|number|p.?number|license/i.test(inp.id + " " + inp.name + " " + (inp.placeholder || "")));
-          const chosen = preferred || inputs[0];
-          return chosen ? (chosen.id || chosen.name || "") : "";
+        const clicked = await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='button'], a"));
+          const btn = btns.find(b => /^\s*search\s*$/i.test((b.textContent || b.value || "").trim()));
+          if (btn) { btn.click(); return true; }
+          return false;
         });
+        if (!clicked) {
+          log("warn", "SAPC: Search button not found by text match — the click above may have been a no-op");
+        }
 
-        if (!inputSel) { resolve(null); return; }
+        await sapcWaitForResults(page, 10000);
+        const table = await sapcExtractTable(page);
 
-        const selStr = `#${CSS.escape(inputSel)}, input[name="${CSS.escape(inputSel)}"]`;
-        await page.type(selStr, registration_number.trim());
-        await new Promise(r => setTimeout(r, 300));
+        if (!table) {
+          const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 1000)).catch(() => "");
+          log("warn", "SAPC: no results table found — site structure may have changed", { body: bodySnippet });
+          resolve(null);
+          return;
+        }
 
-        await page.evaluate(() => {
-          const btns = document.querySelectorAll("button, input[type='submit']");
-          for (const b of btns) {
-            const t = (b.textContent || b.value || "").toLowerCase().trim();
-            if (t.includes("search") || t.includes("find") || t.includes("go") || t === "ok") {
-              b.click(); return;
-            }
-          }
-          const inp = document.querySelector("input:focus");
-          if (inp) {
-            inp.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-            inp.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", bubbles: true }));
-            inp.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
-          }
-        });
+        log("info", "SAPC table found", { headers: table.headers, rowCount: table.rows.length });
 
-        await new Promise(r => setTimeout(r, 6000));
+        const pKey = table.headers.find(h => h.includes("p number"));
+        const firstKey = table.headers.find(h => h.includes("first name"));
+        const surnameKey = table.headers.find(h => h.includes("surname"));
+        const roleKey = table.headers.find(h => h.includes("role"));
+        const statusKey = table.headers.find(h => h.includes("status"));
 
-        const bodyText = await page.evaluate(() => document.body.innerText);
-        const resultText = bodyText.toLowerCase();
+        const row = table.rows.find(r => (r[pKey] || "").toUpperCase().replace(/\s+/g, "") === regNormalized);
 
-        log("info", "SAPC search result", { text: bodyText.substring(0, 2000) });
-
-        const noResultPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no entries", "no data", "there are no"];
-        const showsNoResults = noResultPhrases.some(p => resultText.includes(p));
-        const regFound = resultText.includes(registration_number.trim().toLowerCase());
-        const nameFound = resultText.includes(firstName) || resultText.includes(lastName);
-        const hasData = regFound && !showsNoResults;
-
-        if (hasData && nameFound) {
-          const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
+        if (!row) {
           resolve({
-            success: true,
-            message: "License verified in good standing with the relevant regulatory body.",
-            data: { status: "verified_good", registration_number, name_verified: name, verification_token }
+            success: false,
+            message: "Registration number not found in SAPC records. Please check the number and try again, or upload your license document for manual review.",
+            data: { status: "not_found", registration_number }
           });
           clearTimeout(timer);
           return;
         }
 
-        if (hasData && !nameFound) {
+        const rowFirst = (row[firstKey] || "").toLowerCase();
+        const rowSurname = (row[surnameKey] || "").toLowerCase();
+        const nameMatches =
+          (!!rowSurname && (rowSurname === lastName || rowSurname.includes(lastName) || lastName.includes(rowSurname))) ||
+          (!!rowFirst && (rowFirst === firstName || rowFirst.includes(firstName) || firstName.includes(rowFirst)));
+
+        if (!nameMatches) {
           resolve({
             success: false,
-            message: "Registration number found but name does not match regulatory records.",
+            message: "Registration number found but the name does not match SAPC records.",
             data: { status: "name_mismatch", registration_number }
           });
           clearTimeout(timer);
           return;
         }
 
+        const roleText = row[roleKey] || "";
+        if (roleKey && !/pharmacist/i.test(roleText)) {
+          resolve({
+            success: false,
+            message: `This registration is recorded with SAPC as "${roleText || "a different role"}", not Pharmacist. Please upload your license document for manual review.`,
+            data: { status: "role_mismatch", registration_number, registry_role: roleText }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        const statusText = row[statusKey] || "";
+        const isActive = /active/i.test(statusText);
+
+        if (!isActive) {
+          resolve({
+            success: false,
+            message: `Your registration was found, but its current status is "${statusText || "unknown"}" — not active. Please upload your license document for manual review.`,
+            data: { status: "not_good_standing", registration_number, registry_status: statusText }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
         resolve({
-          success: false,
-          message: "Registration number not found in regulatory records. Please check again or upload your license document for manual review.",
-          data: { status: "not_found", registration_number }
+          success: true,
+          message: "License verified as an active Pharmacist with the South African Pharmacy Council.",
+          data: { status: "verified_good", registration_number, name_verified: name, verification_token }
         });
         clearTimeout(timer);
       } catch (err) {
@@ -955,12 +1072,12 @@ async function verifySAPharmacist(req, res, registration_number, name, country, 
     })();
   });
 
-  if (puppeteerTimedOut) {
+  if (timedOut) {
     log("warn", "SAPC Puppeteer timed out — falling back to manual review");
   }
 
-  if (puppeteerResult) {
-    return res.json(puppeteerResult);
+  if (result) {
+    return res.json(result);
   }
 
   return res.json({
