@@ -192,6 +192,41 @@ function pickShiftFields(data) {
   return picked;
 }
 
+// Insert a shift posting as N rows (one per professional needed) so each
+// spot flows through the existing single-worker apply/accept/QR/payout
+// machinery unchanged. Each row carries the per-worker total_pay; siblings
+// reference the first row via parent_shift_id (informational). Falls back
+// to plain inserts if the parent_shift_id column doesn't exist yet.
+async function insertShiftRows(shiftFields) {
+  const workers = parseInt(shiftFields.workers_needed, 10) || 1;
+  const { workerTotal } = computeShiftAmounts(shiftFields);
+  const perWorkerPay = Math.round((workerTotal / workers) * 100) / 100;
+  const row = { ...shiftFields, total_pay: `GHS ${perWorkerPay.toLocaleString()}` };
+
+  if (workers <= 1) {
+    const { error } = await supabase.from("shifts").insert([row]);
+    return { error };
+  }
+
+  // First row (any preassigned worker goes here), then siblings
+  const { data: first, error: firstError } = await supabase
+    .from("shifts").insert([row]).select("id").single();
+  if (firstError) return { error: firstError };
+
+  const sibling = { ...row };
+  delete sibling.assigned_to_worker_id;
+  const siblings = Array.from({ length: workers - 1 }, () => ({ ...sibling, parent_shift_id: first.id }));
+
+  let { error: sibError } = await supabase.from("shifts").insert(siblings);
+  if (sibError) {
+    // parent_shift_id column may not exist yet — retry without it
+    log("warn", "Sibling insert with parent_shift_id failed, retrying without", { error: sibError.message });
+    siblings.forEach(s => delete s.parent_shift_id);
+    ({ error: sibError } = await supabase.from("shifts").insert(siblings));
+  }
+  return { error: sibError };
+}
+
 function computeShiftAmounts(shiftData) {
   const perDayHours = parseFloat(shiftData.duration_hours) || parseFloat(String(shiftData.duration || "").replace(/[^0-9.]/g, "")) || 0;
   const days = parseInt(shiftData.days_needed) || 1;
@@ -220,6 +255,39 @@ function buildQrUrl(shiftId, workerId, token) {
 }
 
 const GRACE_PERIOD_MINUTES = 15;
+const DEFAULT_GEO_RADIUS_METRES = 100;
+
+// ── Haversine distance between two lat/lng points, in metres ──
+function haversineMetres(lat1, lng1, lat2, lng2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+// Reference coordinates for a shift's check-in location: branch first, then
+// the coordinates stored on the shift row itself. Null when neither is set.
+async function getShiftGeoReference(shift) {
+  if (shift.branch_id) {
+    const { data: branch } = await supabase
+      .from("facility_branches")
+      .select("latitude, longitude")
+      .eq("id", shift.branch_id)
+      .maybeSingle();
+    if (branch?.latitude != null && branch?.longitude != null) {
+      return { lat: parseFloat(branch.latitude), lng: parseFloat(branch.longitude) };
+    }
+  }
+  if (shift.latitude != null && shift.longitude != null) {
+    return { lat: parseFloat(shift.latitude), lng: parseFloat(shift.longitude) };
+  }
+  return null;
+}
 
 function getShiftStartTime(shift) {
   if (!shift.shift_date || !shift.start_time) return null;
@@ -485,9 +553,11 @@ app.get("/verify", async (req, res) => {
 
   log("info", "Verifying license", { registration_number, name, country, role });
 
-  // Currently only auto-verify for Ghana pharmacists
   if (country === "GH" && role === "pharmacist") {
     return await verifyGhanaPharmacist(req, res, registration_number, name, country, role);
+  }
+  if (country === "ZA" && role === "pharmacist") {
+    return await verifySAPharmacist(req, res, registration_number, name, country, role);
   }
 
   return res.json({
@@ -726,6 +796,178 @@ async function verifyGhanaPharmacist(req, res, registration_number, name, countr
   });
 }
 
+// ── South Africa: SAPC register scraper (license format: P + digits, e.g. P48564) ──
+async function verifySAPharmacist(req, res, registration_number, name, country, role) {
+  const nameParts = name.toLowerCase().trim().split(/\s+/);
+  const firstName = nameParts[0] || "";
+  const lastName = nameParts[nameParts.length - 1] || "";
+
+  if (!/^P\s?\d{3,}$/i.test(registration_number.trim())) {
+    return res.json({
+      success: false,
+      message: "SAPC registration numbers start with P followed by digits (e.g. P48564). Please check the number.",
+      data: { status: "invalid_format", registration_number }
+    });
+  }
+
+  let puppeteerTimedOut = false;
+  const PUPPETEER_TIMEOUT = 15000;
+
+  const puppeteerResult = await new Promise(resolve => {
+    const timer = setTimeout(() => {
+      puppeteerTimedOut = true;
+      resolve(null);
+    }, PUPPETEER_TIMEOUT);
+
+    (async () => {
+      let page;
+      let browser;
+      try {
+        browser = await browserPool.getBrowser();
+        page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 800 });
+
+        await page.goto("https://interns.pharma.mm3.co.za/SearchRegister", {
+          waitUntil: "domcontentloaded",
+          timeout: 10000
+        });
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Select the pharmacist register/category if a dropdown is present
+        const allSelects = await page.evaluate(() => {
+          const selects = document.querySelectorAll("select");
+          return Array.from(selects).map((s, i) => ({
+            index: i,
+            options: Array.from(s.options).map(o => ({ value: o.value, text: o.text }))
+          }));
+        });
+        for (const sel of allSelects) {
+          const pharmOpt = sel.options.find(o => o.text.toLowerCase().includes("pharmacist"));
+          if (pharmOpt) {
+            await page.evaluate(({ idx, val }) => {
+              const s = document.querySelectorAll("select")[idx];
+              if (s) { s.value = val; s.dispatchEvent(new Event("change", { bubbles: true })); }
+            }, { idx: sel.index, val: pharmOpt.value });
+            break;
+          }
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Prefer an input whose id/name/placeholder mentions the registration number
+        const inputSel = await page.evaluate(() => {
+          const inputs = Array.from(document.querySelectorAll(
+            "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio'])"
+          )).filter(inp => inp.offsetParent !== null);
+          const preferred = inputs.find(inp =>
+            /reg|number|p.?number|license/i.test(inp.id + " " + inp.name + " " + (inp.placeholder || "")));
+          const chosen = preferred || inputs[0];
+          return chosen ? (chosen.id || chosen.name || "") : "";
+        });
+
+        if (!inputSel) { resolve(null); return; }
+
+        const selStr = `#${CSS.escape(inputSel)}, input[name="${CSS.escape(inputSel)}"]`;
+        await page.type(selStr, registration_number.trim());
+        await new Promise(r => setTimeout(r, 300));
+
+        await page.evaluate(() => {
+          const btns = document.querySelectorAll("button, input[type='submit']");
+          for (const b of btns) {
+            const t = (b.textContent || b.value || "").toLowerCase().trim();
+            if (t.includes("search") || t.includes("find") || t.includes("go") || t === "ok") {
+              b.click(); return;
+            }
+          }
+          const inp = document.querySelector("input:focus");
+          if (inp) {
+            inp.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+            inp.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", bubbles: true }));
+            inp.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
+          }
+        });
+
+        await new Promise(r => setTimeout(r, 6000));
+
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        const resultText = bodyText.toLowerCase();
+
+        log("info", "SAPC search result", { text: bodyText.substring(0, 2000) });
+
+        const noResultPhrases = ["no results", "no record", "not found", "nothing found", "0 results", "no entries", "no data", "there are no"];
+        const showsNoResults = noResultPhrases.some(p => resultText.includes(p));
+        const regFound = resultText.includes(registration_number.trim().toLowerCase());
+        const nameFound = resultText.includes(firstName) || resultText.includes(lastName);
+        const hasData = regFound && !showsNoResults;
+
+        if (hasData && nameFound) {
+          const verification_token = signLicenseVerification({ registration_number, name, country, role, iat: Date.now() });
+          resolve({
+            success: true,
+            message: "License verified in good standing with the relevant regulatory body.",
+            data: { status: "verified_good", registration_number, name_verified: name, verification_token }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        if (hasData && !nameFound) {
+          resolve({
+            success: false,
+            message: "Registration number found but name does not match regulatory records.",
+            data: { status: "name_mismatch", registration_number }
+          });
+          clearTimeout(timer);
+          return;
+        }
+
+        resolve({
+          success: false,
+          message: "Registration number not found in regulatory records. Please check again or upload your license document for manual review.",
+          data: { status: "not_found", registration_number }
+        });
+        clearTimeout(timer);
+      } catch (err) {
+        log("error", "SAPC Puppeteer error", { error: err.message, stack: err.stack?.substring(0, 500) });
+        resolve(null);
+      } finally {
+        try { if (page) await page.close(); } catch (_) {}
+        clearTimeout(timer);
+      }
+    })();
+  });
+
+  if (puppeteerTimedOut) {
+    log("warn", "SAPC Puppeteer timed out — falling back to manual review");
+  }
+
+  if (puppeteerResult) {
+    return res.json(puppeteerResult);
+  }
+
+  return res.json({
+    success: false,
+    message: "Auto-verification is temporarily unavailable. Upload your license document for manual review by our team.",
+    data: { status: "manual_review", registration_number }
+  });
+}
+
+// Alias route: same parameters as /verify, always treated as ZA
+app.get("/verify-za", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  if (!checkRateLimit(ip, 5, 60000)) {
+    return res.status(429).json({ success: false, message: "Too many verification requests. Please wait a minute and try again." });
+  }
+  const registration_number = sanitize(req.query.registration_number);
+  const name = sanitize(req.query.name);
+  const role = (req.query.role || "pharmacist").toLowerCase();
+  if (!registration_number || !name) {
+    return res.status(400).json({ success: false, message: "Registration number and name are required." });
+  }
+  return await verifySAPharmacist(req, res, registration_number, name, "ZA", role);
+});
+
 app.post("/verify-identity", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
@@ -804,13 +1046,37 @@ app.post("/payment/initialize", async (req, res) => {
   const wantsPostpaid = req.body.payment_method === "postpaid";
 
   let isTrusted = false;
+  let creditLimit = 0;
   if (wantsPostpaid) {
     const { data: facility } = await supabase
       .from("facilities")
-      .select("billing_model, trusted_by")
+      .select("billing_model, trusted_by, credit_limit")
       .eq("email", email)
       .maybeSingle();
     isTrusted = facility?.billing_model === "postpaid" && facility?.trusted_by;
+    creditLimit = parseFloat(facility?.credit_limit) || 0;
+  }
+
+  // ── Enforce monthly credit limit (0 = no limit set) ──
+  if (wantsPostpaid && isTrusted && creditLimit > 0) {
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
+    const { data: monthShifts } = await supabase
+      .from("shifts")
+      .select("total_pay")
+      .eq("contact_email", email)
+      .eq("payment_status", "postpaid")
+      .gte("created_at", monthStart);
+    const usedCredit = (monthShifts || []).reduce((sum, s) => {
+      return sum + (parseFloat(String(s.total_pay || "").replace(/[^0-9.]/g, "")) || 0) * 1.25;
+    }, 0);
+    if (usedCredit + facilityTotal > creditLimit) {
+      log("info", "Postpaid credit limit exceeded", { email, usedCredit, creditLimit });
+      return res.status(402).json({
+        success: false,
+        credit_limit_exceeded: true,
+        message: `Monthly credit limit reached (GHS ${Math.round(usedCredit).toLocaleString()} of GHS ${creditLimit.toLocaleString()} used). Please pay upfront for this shift, or contact CoverCare to raise your limit.`
+      });
+    }
   }
 
   if (wantsPostpaid && isTrusted) {
@@ -819,10 +1085,9 @@ app.post("/payment/initialize", async (req, res) => {
     shiftFields.contact_email = user.email;
     shiftFields.payment_status = "postpaid";
     shiftFields.status = "open";
-    const { workerTotal, facilityTotal: ft } = computeShiftAmounts(shiftFields);
-    shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+    const { facilityTotal: ft } = computeShiftAmounts(shiftFields);
 
-    const { error: insertError } = await supabase.from("shifts").insert([shiftFields]);
+    const { error: insertError } = await insertShiftRows(shiftFields);
     if (insertError) {
       log("error", "Trusted facility shift insert error", { error: insertError.message, email });
       return res.status(500).json({ success: false, message: "Failed to create shift." });
@@ -858,10 +1123,9 @@ app.post("/payment/initialize", async (req, res) => {
       shiftFields.contact_email = user.email;
       shiftFields.payment_status = "paid";
       shiftFields.status = "open";
-      const { workerTotal, facilityTotal: ft } = computeShiftAmounts(shiftFields);
-      shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+      const { facilityTotal: ft } = computeShiftAmounts(shiftFields);
 
-      const { error: insertError } = await supabase.from("shifts").insert([shiftFields]);
+      const { error: insertError } = await insertShiftRows(shiftFields);
       if (insertError) {
         // Refund wallet if shift insert fails
         await updateWallet(email, userType, "refund", facilityTotal, null, "Refund for failed shift creation");
@@ -966,11 +1230,9 @@ app.post("/payment/verify", async (req, res) => {
       return res.status(400).json({ success: false, message: "Paid amount does not match expected shift cost." });
     }
 
-    shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
-
-    const { error } = await supabase.from("shifts").insert([{
+    const { error } = await insertShiftRows({
       ...shiftFields, payment_reference: reference, payment_status: "paid", status: "open"
-    }]);
+    });
 
     if (error) {
       log("error", "Shift save error after payment", { error: error.message, reference });
@@ -1155,6 +1417,43 @@ app.post("/shift/arrive", async (req, res) => {
     return res.status(400).json({ success: false, message: `Cannot check in — shift status is "${shift.status}".` });
   }
 
+  // ── Geo confirmation: device must be at the facility (or explicitly override) ──
+  const checkinLat = req.body.checkin_latitude != null ? parseFloat(req.body.checkin_latitude) : null;
+  const checkinLng = req.body.checkin_longitude != null ? parseFloat(req.body.checkin_longitude) : null;
+  const geoOverride = req.body.geo_override === true;
+  const geoOverrideReason = sanitize(req.body.geo_override_reason || "");
+
+  if (geoOverride && !geoOverrideReason) {
+    return res.status(400).json({ success: false, message: "A reason is required when overriding the location check." });
+  }
+
+  const geoRef = await getShiftGeoReference(shift);
+  let geoDistance = null;
+  let geoVerified = false;
+
+  if (geoRef && !geoOverride) {
+    if (checkinLat == null || checkinLng == null || Number.isNaN(checkinLat) || Number.isNaN(checkinLng)) {
+      return res.status(400).json({
+        success: false,
+        geo_required: true,
+        message: "Location access is required to check in. Enable location services, or use the manual override."
+      });
+    }
+    geoDistance = haversineMetres(checkinLat, checkinLng, geoRef.lat, geoRef.lng);
+    const radius = parseInt(shift.geo_radius_metres, 10) || DEFAULT_GEO_RADIUS_METRES;
+    if (geoDistance > radius) {
+      return res.status(403).json({
+        success: false,
+        geo_blocked: true,
+        distance_metres: geoDistance,
+        message: `You must be at the facility to check in. You are ${geoDistance >= 1000 ? (geoDistance / 1000).toFixed(1) + "km" : geoDistance + "m"} away from ${shift.facility_name || "the facility"}.`
+      });
+    }
+    geoVerified = true;
+  } else if (geoRef && geoOverride && checkinLat != null && checkinLng != null) {
+    geoDistance = haversineMetres(checkinLat, checkinLng, geoRef.lat, geoRef.lng);
+  }
+
   const arrivalTime = new Date();
   const lateMinutes = calcLateMinutes(shift, arrivalTime);
   const durationHours = getShiftDurationHours(shift);
@@ -1171,18 +1470,56 @@ app.post("/shift/arrive", async (req, res) => {
   };
   if (lateMinutes > 0) updateFields.adjusted_pay = adjustedPay;
 
-  const { data, error } = await supabase
+  const geoFields = {};
+  if (checkinLat != null && !Number.isNaN(checkinLat)) geoFields.checkin_latitude = checkinLat;
+  if (checkinLng != null && !Number.isNaN(checkinLng)) geoFields.checkin_longitude = checkinLng;
+  if (geoDistance != null) geoFields.checkin_distance_metres = geoDistance;
+  geoFields.geo_verified = geoVerified;
+  if (geoOverride) {
+    geoFields.geo_override = true;
+    geoFields.geo_override_reason = geoOverrideReason;
+  }
+
+  let { data, error } = await supabase
     .from("shifts")
-    .update(updateFields)
+    .update({ ...updateFields, ...geoFields })
     .eq("id", shiftId)
     .eq("status", "accepted")
     .select()
     .single();
 
+  // Geo columns may not exist yet (migration pending) — retry without them
+  // rather than blocking check-in.
+  if (error) {
+    log("warn", "Arrive update with geo fields failed, retrying without", { error: error.message });
+    ({ data, error } = await supabase
+      .from("shifts")
+      .update(updateFields)
+      .eq("id", shiftId)
+      .eq("status", "accepted")
+      .select()
+      .single());
+  }
+
   if (error || !data) {
     log("error", "Shift arrive error", { error: error?.message });
     return res.status(500).json({ success: false, message: "Failed to log arrival." });
   }
+
+  // ── Punctuality counters (best-effort; columns may not exist yet) ──
+  try {
+    const { data: wStats } = await supabase
+      .from("workers")
+      .select("on_time_arrivals, late_arrivals")
+      .eq("id", workerId)
+      .maybeSingle();
+    if (wStats) {
+      const counterUpdate = lateMinutes > 0
+        ? { late_arrivals: (parseInt(wStats.late_arrivals, 10) || 0) + 1 }
+        : { on_time_arrivals: (parseInt(wStats.on_time_arrivals, 10) || 0) + 1 };
+      await supabase.from("workers").update(counterUpdate).eq("id", workerId);
+    }
+  } catch (_) {}
 
   const { data: worker } = await supabase
     .from("workers")
@@ -1200,6 +1537,8 @@ app.post("/shift/arrive", async (req, res) => {
     late_minutes: lateMinutes,
     adjusted_pay: adjustedPay,
     facility_credit: facilityCredit,
+    geo_verified: geoVerified,
+    checkin_distance_metres: geoDistance,
     worker,
     shift: data
   });
@@ -2295,6 +2634,45 @@ app.post("/admin/approve-facility", async (req, res) => {
   return res.json({ success: true, message: "Facility approved for postpaid billing." });
 });
 
+// ── Admin: set monthly credit limit for a trusted facility ──
+app.post("/admin/set-credit-limit", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const email = sanitize(req.body.email);
+  const creditLimit = parseFloat(req.body.credit_limit);
+  if (!email || Number.isNaN(creditLimit) || creditLimit < 0) {
+    return res.status(400).json({ success: false, message: "Facility email and a non-negative credit_limit are required." });
+  }
+
+  const { data: facility } = await supabase
+    .from("facilities")
+    .select("id, billing_model")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (!facility) {
+    return res.status(404).json({ success: false, message: "Facility not found." });
+  }
+  if (facility.billing_model !== "postpaid") {
+    return res.status(400).json({ success: false, message: "Facility must be approved for postpaid billing first." });
+  }
+
+  const { error } = await supabase
+    .from("facilities")
+    .update({ credit_limit: creditLimit })
+    .eq("email", email);
+
+  if (error) {
+    log("error", "Set credit limit error", { error: error.message, email });
+    return res.status(500).json({ success: false, message: "Failed to set credit limit." });
+  }
+
+  log("info", "Credit limit set", { email, creditLimit, admin: user.email });
+  return res.json({ success: true, message: `Credit limit set to GHS ${creditLimit.toLocaleString()}.` });
+});
+
 // ── Admin: revoke postpaid billing ──
 app.post("/admin/revoke-facility", async (req, res) => {
   const user = await requireAuth(req, res);
@@ -2328,7 +2706,7 @@ app.get("/admin/trusted-facilities", async (req, res) => {
 
   const { data: facilities, error: facError } = await supabase
     .from("facilities")
-    .select("id, facility_name, email, city, billing_model, trusted_by, created_at")
+    .select("id, facility_name, email, city, billing_model, trusted_by, credit_limit, created_at")
     .eq("billing_model", "postpaid")
     .order("created_at", { ascending: false });
 
@@ -2669,6 +3047,7 @@ function normalizeWorkerRole(role) {
     "lab-technician": "lab-technician",
     "pharmacist": "pharmacist",
     "pharmacy-tech": "pharmacy-tech",
+    "medicine-counter-assistant": "medicine-counter-assistant",
     "nurse": "nurse",
     "doctor": "medical-doctor",
     "lab-tech": "lab-technician",
@@ -2697,7 +3076,7 @@ app.get("/shifts/open", async (req, res) => {
   const workerRole = worker ? normalizeWorkerRole(worker.role) : null;
   const workerId = worker?.id || null;
 
-  const SELECT_COLS = "id, facility_name, role_needed, city, shift_date, start_time, duration, duration_hours, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
+  const SELECT_COLS = "id, facility_name, role_needed, city, shift_date, start_time, duration, duration_hours, days_needed, workers_needed, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
 
   let openQuery = supabase.from("shifts").select(SELECT_COLS).eq("status", "open");
   if (workerRole) openQuery = openQuery.eq("role_needed", workerRole);
@@ -2744,6 +3123,25 @@ app.get("/shifts/open", async (req, res) => {
 
   const assignedIds = new Set(assignedShifts.map(s => s.id));
 
+  // Collapse sibling rows of a multi-worker posting into one listing with a
+  // spots count. Grouped by posting fingerprint (no schema dependency);
+  // assigned shifts are never collapsed.
+  const groups = new Map();
+  const collapsed = [];
+  for (const s of allData) {
+    if (assignedIds.has(s.id) || s.status !== "open") { collapsed.push(s); continue; }
+    const key = [s.contact_email, s.facility_name, s.role_needed, s.shift_date, s.start_time, s.duration, s.pay_rate, s.branch_id].join("|");
+    const existing = groups.get(key);
+    if (existing) {
+      existing._spots_open = (existing._spots_open || 1) + 1;
+    } else {
+      s._spots_open = 1;
+      groups.set(key, s);
+      collapsed.push(s);
+    }
+  }
+  allData = collapsed;
+
   const data = allData.map(s => {
     const poster = posterMap[s.contact_email?.toLowerCase()];
     const branch = branchMap[s.branch_id];
@@ -2756,6 +3154,9 @@ app.get("/shifts/open", async (req, res) => {
       start_time: s.start_time,
       duration: s.duration,
       duration_hours: s.duration_hours,
+      days_needed: s.days_needed,
+      workers_needed: s.workers_needed,
+      _spots_open: s._spots_open || 1,
       pay_rate: s.pay_rate,
       urgency: s.urgency,
       status: s.status,
@@ -4787,6 +5188,7 @@ app.get("/roles/rates", (req, res) => {
       nurse: 60,
       "medical-doctor": 120,
       "lab-technician": 40,
+      "medicine-counter-assistant": 30,
       caregiver: 25,
       other: 35
     },
