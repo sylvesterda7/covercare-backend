@@ -5457,6 +5457,38 @@ app.put("/settings/facility", async (req, res) => {
 });
 
 // ── Facility branches ──
+// Return worker details ONLY for workers assigned to one of the caller's own
+// shifts. Replaces the facility dashboard's direct workers.select(...) reads,
+// so worker PII (phone/email) is no longer exposed to the whole internet via
+// the public read policy — a facility sees only workers it actually hired.
+app.post("/facility/shift-workers", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!rateLimitRoute(req, res, 60)) return;
+
+  const requested = Array.isArray(req.body.worker_ids) ? req.body.worker_ids.map(String) : [];
+  if (requested.length === 0) return res.json({ success: true, data: [] });
+
+  // Legitimate worker ids = those assigned to this facility's shifts.
+  const { data: shifts } = await supabase
+    .from("shifts")
+    .select("worker_id")
+    .eq("contact_email", user.email.toLowerCase());
+  const allowed = new Set((shifts || []).map(s => String(s.worker_id)).filter(Boolean));
+  const ids = requested.filter(id => allowed.has(id));
+  if (ids.length === 0) return res.json({ success: true, data: [] });
+
+  const { data: workers, error } = await supabase
+    .from("workers")
+    .select("id, full_name, role, phone, email, city, experience, bio, profile_photo_url, license_verified, identity_verified")
+    .in("id", ids);
+  if (error) {
+    log("error", "Facility shift-workers error", { error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to load worker details." });
+  }
+  return res.json({ success: true, data: workers || [] });
+});
+
 app.get("/facility/branches", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
