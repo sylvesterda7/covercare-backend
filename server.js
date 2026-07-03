@@ -192,6 +192,41 @@ function pickShiftFields(data) {
   return picked;
 }
 
+// Insert a shift posting as N rows (one per professional needed) so each
+// spot flows through the existing single-worker apply/accept/QR/payout
+// machinery unchanged. Each row carries the per-worker total_pay; siblings
+// reference the first row via parent_shift_id (informational). Falls back
+// to plain inserts if the parent_shift_id column doesn't exist yet.
+async function insertShiftRows(shiftFields) {
+  const workers = parseInt(shiftFields.workers_needed, 10) || 1;
+  const { workerTotal } = computeShiftAmounts(shiftFields);
+  const perWorkerPay = Math.round((workerTotal / workers) * 100) / 100;
+  const row = { ...shiftFields, total_pay: `GHS ${perWorkerPay.toLocaleString()}` };
+
+  if (workers <= 1) {
+    const { error } = await supabase.from("shifts").insert([row]);
+    return { error };
+  }
+
+  // First row (any preassigned worker goes here), then siblings
+  const { data: first, error: firstError } = await supabase
+    .from("shifts").insert([row]).select("id").single();
+  if (firstError) return { error: firstError };
+
+  const sibling = { ...row };
+  delete sibling.assigned_to_worker_id;
+  const siblings = Array.from({ length: workers - 1 }, () => ({ ...sibling, parent_shift_id: first.id }));
+
+  let { error: sibError } = await supabase.from("shifts").insert(siblings);
+  if (sibError) {
+    // parent_shift_id column may not exist yet — retry without it
+    log("warn", "Sibling insert with parent_shift_id failed, retrying without", { error: sibError.message });
+    siblings.forEach(s => delete s.parent_shift_id);
+    ({ error: sibError } = await supabase.from("shifts").insert(siblings));
+  }
+  return { error: sibError };
+}
+
 function computeShiftAmounts(shiftData) {
   const perDayHours = parseFloat(shiftData.duration_hours) || parseFloat(String(shiftData.duration || "").replace(/[^0-9.]/g, "")) || 0;
   const days = parseInt(shiftData.days_needed) || 1;
@@ -1050,10 +1085,9 @@ app.post("/payment/initialize", async (req, res) => {
     shiftFields.contact_email = user.email;
     shiftFields.payment_status = "postpaid";
     shiftFields.status = "open";
-    const { workerTotal, facilityTotal: ft } = computeShiftAmounts(shiftFields);
-    shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+    const { facilityTotal: ft } = computeShiftAmounts(shiftFields);
 
-    const { error: insertError } = await supabase.from("shifts").insert([shiftFields]);
+    const { error: insertError } = await insertShiftRows(shiftFields);
     if (insertError) {
       log("error", "Trusted facility shift insert error", { error: insertError.message, email });
       return res.status(500).json({ success: false, message: "Failed to create shift." });
@@ -1089,10 +1123,9 @@ app.post("/payment/initialize", async (req, res) => {
       shiftFields.contact_email = user.email;
       shiftFields.payment_status = "paid";
       shiftFields.status = "open";
-      const { workerTotal, facilityTotal: ft } = computeShiftAmounts(shiftFields);
-      shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
+      const { facilityTotal: ft } = computeShiftAmounts(shiftFields);
 
-      const { error: insertError } = await supabase.from("shifts").insert([shiftFields]);
+      const { error: insertError } = await insertShiftRows(shiftFields);
       if (insertError) {
         // Refund wallet if shift insert fails
         await updateWallet(email, userType, "refund", facilityTotal, null, "Refund for failed shift creation");
@@ -1197,11 +1230,9 @@ app.post("/payment/verify", async (req, res) => {
       return res.status(400).json({ success: false, message: "Paid amount does not match expected shift cost." });
     }
 
-    shiftFields.total_pay = `GHS ${workerTotal.toLocaleString()}`;
-
-    const { error } = await supabase.from("shifts").insert([{
+    const { error } = await insertShiftRows({
       ...shiftFields, payment_reference: reference, payment_status: "paid", status: "open"
-    }]);
+    });
 
     if (error) {
       log("error", "Shift save error after payment", { error: error.message, reference });
@@ -3092,6 +3123,25 @@ app.get("/shifts/open", async (req, res) => {
 
   const assignedIds = new Set(assignedShifts.map(s => s.id));
 
+  // Collapse sibling rows of a multi-worker posting into one listing with a
+  // spots count. Grouped by posting fingerprint (no schema dependency);
+  // assigned shifts are never collapsed.
+  const groups = new Map();
+  const collapsed = [];
+  for (const s of allData) {
+    if (assignedIds.has(s.id) || s.status !== "open") { collapsed.push(s); continue; }
+    const key = [s.contact_email, s.facility_name, s.role_needed, s.shift_date, s.start_time, s.duration, s.pay_rate, s.branch_id].join("|");
+    const existing = groups.get(key);
+    if (existing) {
+      existing._spots_open = (existing._spots_open || 1) + 1;
+    } else {
+      s._spots_open = 1;
+      groups.set(key, s);
+      collapsed.push(s);
+    }
+  }
+  allData = collapsed;
+
   const data = allData.map(s => {
     const poster = posterMap[s.contact_email?.toLowerCase()];
     const branch = branchMap[s.branch_id];
@@ -3106,6 +3156,7 @@ app.get("/shifts/open", async (req, res) => {
       duration_hours: s.duration_hours,
       days_needed: s.days_needed,
       workers_needed: s.workers_needed,
+      _spots_open: s._spots_open || 1,
       pay_rate: s.pay_rate,
       urgency: s.urgency,
       status: s.status,
