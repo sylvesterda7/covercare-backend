@@ -2663,6 +2663,118 @@ app.post("/account/delete", async (req, res) => {
   return res.json({ success: true, message: "Account permanently deleted." });
 });
 
+function normalizeWorkerRole(role) {
+  const map = {
+    "medical-doctor": "medical-doctor",
+    "lab-technician": "lab-technician",
+    "pharmacist": "pharmacist",
+    "pharmacy-tech": "pharmacy-tech",
+    "nurse": "nurse",
+    "doctor": "medical-doctor",
+    "lab-tech": "lab-technician",
+    "caregiver": "caregiver",
+    "midwife": "midwife",
+    "community health worker": "community health worker",
+    "other": null
+  };
+  if (!role) return null;
+  const key = role.toLowerCase();
+  return map[key] || null;
+}
+
+// Public open-shifts listing for workers. Does the poster/branch joins server-side
+// so contact_email/contact_phone/address/qr_token/payment fields never reach the browser.
+app.get("/shifts/open", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+
+  const { data: worker } = await supabase
+    .from("workers")
+    .select("id, role")
+    .eq("email", user.email)
+    .maybeSingle();
+
+  const workerRole = worker ? normalizeWorkerRole(worker.role) : null;
+  const workerId = worker?.id || null;
+
+  const SELECT_COLS = "id, facility_name, role_needed, city, shift_date, start_time, duration, duration_hours, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
+
+  let openQuery = supabase.from("shifts").select(SELECT_COLS).eq("status", "open");
+  if (workerRole) openQuery = openQuery.eq("role_needed", workerRole);
+  const { data: openShifts, error: openError } = await openQuery.order("created_at", { ascending: false }).limit(20);
+  if (openError) {
+    log("error", "Open shifts fetch error", { error: openError.message });
+    return res.status(500).json({ success: false, message: "Failed to load shifts." });
+  }
+
+  let assignedShifts = [];
+  if (workerId) {
+    const { data: as, error: asError } = await supabase
+      .from("shifts")
+      .select(SELECT_COLS)
+      .eq("assigned_to_worker_id", workerId)
+      .in("status", ["open", "accepted", "in_progress"])
+      .order("created_at", { ascending: false });
+    if (!asError && as) assignedShifts = as;
+  }
+
+  let allData = [...(openShifts || []), ...assignedShifts];
+  const seen = new Set();
+  allData = allData.filter(s => { if (seen.has(s.id)) return false; seen.add(s.id); return true; });
+
+  const clientEmails = [...new Set(allData.map(s => s.contact_email?.toLowerCase()).filter(Boolean))];
+  const posterMap = {};
+  if (clientEmails.length > 0) {
+    const { data: clients } = await supabase
+      .from("clients")
+      .select("email, full_name, profile_photo_url, city")
+      .in("email", clientEmails);
+    if (clients) clients.forEach(c => { posterMap[c.email.toLowerCase()] = c; });
+  }
+
+  const branchIds = [...new Set(allData.map(s => s.branch_id).filter(Boolean))];
+  const branchMap = {};
+  if (branchIds.length > 0) {
+    const { data: branches } = await supabase
+      .from("facility_branches")
+      .select("id, name, address, latitude, longitude")
+      .in("id", branchIds);
+    if (branches) branches.forEach(b => { branchMap[b.id] = b; });
+  }
+
+  const assignedIds = new Set(assignedShifts.map(s => s.id));
+
+  const data = allData.map(s => {
+    const poster = posterMap[s.contact_email?.toLowerCase()];
+    const branch = branchMap[s.branch_id];
+    return {
+      id: s.id,
+      facility_name: s.facility_name,
+      role_needed: s.role_needed,
+      city: s.city,
+      shift_date: s.shift_date,
+      start_time: s.start_time,
+      duration: s.duration,
+      duration_hours: s.duration_hours,
+      pay_rate: s.pay_rate,
+      urgency: s.urgency,
+      status: s.status,
+      branch_id: s.branch_id,
+      assigned_to_worker_id: s.assigned_to_worker_id,
+      _poster_name: poster?.full_name || null,
+      _poster_photo: poster?.profile_photo_url || null,
+      _poster_city: poster?.city || null,
+      _branch_name: branch?.name || null,
+      _branch_address: branch?.address || null,
+      _branch_lat: branch?.latitude || null,
+      _branch_lng: branch?.longitude || null,
+      _is_assigned: assignedIds.has(s.id)
+    };
+  });
+
+  return res.json({ success: true, data });
+});
+
 app.get("/shifts/history", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
