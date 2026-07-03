@@ -220,6 +220,39 @@ function buildQrUrl(shiftId, workerId, token) {
 }
 
 const GRACE_PERIOD_MINUTES = 15;
+const DEFAULT_GEO_RADIUS_METRES = 100;
+
+// ── Haversine distance between two lat/lng points, in metres ──
+function haversineMetres(lat1, lng1, lat2, lng2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+// Reference coordinates for a shift's check-in location: branch first, then
+// the coordinates stored on the shift row itself. Null when neither is set.
+async function getShiftGeoReference(shift) {
+  if (shift.branch_id) {
+    const { data: branch } = await supabase
+      .from("facility_branches")
+      .select("latitude, longitude")
+      .eq("id", shift.branch_id)
+      .maybeSingle();
+    if (branch?.latitude != null && branch?.longitude != null) {
+      return { lat: parseFloat(branch.latitude), lng: parseFloat(branch.longitude) };
+    }
+  }
+  if (shift.latitude != null && shift.longitude != null) {
+    return { lat: parseFloat(shift.latitude), lng: parseFloat(shift.longitude) };
+  }
+  return null;
+}
 
 function getShiftStartTime(shift) {
   if (!shift.shift_date || !shift.start_time) return null;
@@ -1179,6 +1212,43 @@ app.post("/shift/arrive", async (req, res) => {
     return res.status(400).json({ success: false, message: `Cannot check in — shift status is "${shift.status}".` });
   }
 
+  // ── Geo confirmation: device must be at the facility (or explicitly override) ──
+  const checkinLat = req.body.checkin_latitude != null ? parseFloat(req.body.checkin_latitude) : null;
+  const checkinLng = req.body.checkin_longitude != null ? parseFloat(req.body.checkin_longitude) : null;
+  const geoOverride = req.body.geo_override === true;
+  const geoOverrideReason = sanitize(req.body.geo_override_reason || "");
+
+  if (geoOverride && !geoOverrideReason) {
+    return res.status(400).json({ success: false, message: "A reason is required when overriding the location check." });
+  }
+
+  const geoRef = await getShiftGeoReference(shift);
+  let geoDistance = null;
+  let geoVerified = false;
+
+  if (geoRef && !geoOverride) {
+    if (checkinLat == null || checkinLng == null || Number.isNaN(checkinLat) || Number.isNaN(checkinLng)) {
+      return res.status(400).json({
+        success: false,
+        geo_required: true,
+        message: "Location access is required to check in. Enable location services, or use the manual override."
+      });
+    }
+    geoDistance = haversineMetres(checkinLat, checkinLng, geoRef.lat, geoRef.lng);
+    const radius = parseInt(shift.geo_radius_metres, 10) || DEFAULT_GEO_RADIUS_METRES;
+    if (geoDistance > radius) {
+      return res.status(403).json({
+        success: false,
+        geo_blocked: true,
+        distance_metres: geoDistance,
+        message: `You must be at the facility to check in. You are ${geoDistance >= 1000 ? (geoDistance / 1000).toFixed(1) + "km" : geoDistance + "m"} away from ${shift.facility_name || "the facility"}.`
+      });
+    }
+    geoVerified = true;
+  } else if (geoRef && geoOverride && checkinLat != null && checkinLng != null) {
+    geoDistance = haversineMetres(checkinLat, checkinLng, geoRef.lat, geoRef.lng);
+  }
+
   const arrivalTime = new Date();
   const lateMinutes = calcLateMinutes(shift, arrivalTime);
   const durationHours = getShiftDurationHours(shift);
@@ -1195,18 +1265,56 @@ app.post("/shift/arrive", async (req, res) => {
   };
   if (lateMinutes > 0) updateFields.adjusted_pay = adjustedPay;
 
-  const { data, error } = await supabase
+  const geoFields = {};
+  if (checkinLat != null && !Number.isNaN(checkinLat)) geoFields.checkin_latitude = checkinLat;
+  if (checkinLng != null && !Number.isNaN(checkinLng)) geoFields.checkin_longitude = checkinLng;
+  if (geoDistance != null) geoFields.checkin_distance_metres = geoDistance;
+  geoFields.geo_verified = geoVerified;
+  if (geoOverride) {
+    geoFields.geo_override = true;
+    geoFields.geo_override_reason = geoOverrideReason;
+  }
+
+  let { data, error } = await supabase
     .from("shifts")
-    .update(updateFields)
+    .update({ ...updateFields, ...geoFields })
     .eq("id", shiftId)
     .eq("status", "accepted")
     .select()
     .single();
 
+  // Geo columns may not exist yet (migration pending) — retry without them
+  // rather than blocking check-in.
+  if (error) {
+    log("warn", "Arrive update with geo fields failed, retrying without", { error: error.message });
+    ({ data, error } = await supabase
+      .from("shifts")
+      .update(updateFields)
+      .eq("id", shiftId)
+      .eq("status", "accepted")
+      .select()
+      .single());
+  }
+
   if (error || !data) {
     log("error", "Shift arrive error", { error: error?.message });
     return res.status(500).json({ success: false, message: "Failed to log arrival." });
   }
+
+  // ── Punctuality counters (best-effort; columns may not exist yet) ──
+  try {
+    const { data: wStats } = await supabase
+      .from("workers")
+      .select("on_time_arrivals, late_arrivals")
+      .eq("id", workerId)
+      .maybeSingle();
+    if (wStats) {
+      const counterUpdate = lateMinutes > 0
+        ? { late_arrivals: (parseInt(wStats.late_arrivals, 10) || 0) + 1 }
+        : { on_time_arrivals: (parseInt(wStats.on_time_arrivals, 10) || 0) + 1 };
+      await supabase.from("workers").update(counterUpdate).eq("id", workerId);
+    }
+  } catch (_) {}
 
   const { data: worker } = await supabase
     .from("workers")
@@ -1224,6 +1332,8 @@ app.post("/shift/arrive", async (req, res) => {
     late_minutes: lateMinutes,
     adjusted_pay: adjustedPay,
     facility_credit: facilityCredit,
+    geo_verified: geoVerified,
+    checkin_distance_metres: geoDistance,
     worker,
     shift: data
   });
