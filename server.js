@@ -2669,6 +2669,7 @@ function normalizeWorkerRole(role) {
     "lab-technician": "lab-technician",
     "pharmacist": "pharmacist",
     "pharmacy-tech": "pharmacy-tech",
+    "medicine-counter-assistant": "medicine-counter-assistant",
     "nurse": "nurse",
     "doctor": "medical-doctor",
     "lab-tech": "lab-technician",
@@ -4787,6 +4788,7 @@ app.get("/roles/rates", (req, res) => {
       nurse: 60,
       "medical-doctor": 120,
       "lab-technician": 40,
+      "medicine-counter-assistant": 30,
       caregiver: 25,
       other: 35
     },
