@@ -3009,6 +3009,7 @@ app.get("/admin/payments", async (req, res) => {
       shift_date: s.shift_date,
       start_time: s.start_time,
       duration: s.duration,
+      country: s.country || "unknown",
       total_pay: parsePayAmount(s.total_pay),
       facility_total: Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100,
       payment_status: s.payment_status,
