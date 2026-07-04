@@ -242,6 +242,34 @@ async function getPosterCountry(email) {
   return client?.country || null;
 }
 
+// Gate 1: an account can only use the platform once BOTH its email and
+// phone are confirmed with Supabase Auth. This reads straight off the auth
+// user object requireAuth already fetched — no domain-table column needed.
+function hasVerifiedContact(user) {
+  return !!(user?.email_confirmed_at && user?.phone_confirmed_at);
+}
+
+// Gate 2: whether the posting facility/client has been reviewed and
+// activated by an admin (mirrors workers.activated — see /admin/activate-*).
+async function getPosterActivation(email) {
+  if (!email) return false;
+  const lower = email.toLowerCase();
+
+  const { data: facility } = await supabase
+    .from("facilities")
+    .select("activated")
+    .eq("email", lower)
+    .maybeSingle();
+  if (facility) return !!facility.activated;
+
+  const { data: client } = await supabase
+    .from("clients")
+    .select("activated")
+    .eq("email", lower)
+    .maybeSingle();
+  return !!client?.activated;
+}
+
 // Insert a shift posting as N rows (one per professional needed) so each
 // spot flows through the existing single-worker apply/accept/QR/payout
 // machinery unchanged. Each row carries the per-worker total_pay; siblings
@@ -1145,6 +1173,7 @@ app.post("/verify-identity", async (req, res) => {
   const email = sanitize(req.body.email);
   const selfie_url = req.body.selfie_url;
   const id_document_url = req.body.id_document_url;
+  const id_document_type = sanitize(req.body.id_document_type || "");
 
   if (!email) {
     return res.status(400).json({ success: false, message: "Email is required." });
@@ -1152,6 +1181,10 @@ app.post("/verify-identity", async (req, res) => {
 
   if (user.email.toLowerCase() !== email.toLowerCase()) {
     return res.status(403).json({ success: false, message: "Email does not match your authenticated account." });
+  }
+
+  if (id_document_url && !["government_id", "passport"].includes(id_document_type)) {
+    return res.status(400).json({ success: false, message: "id_document_type must be government_id or passport." });
   }
 
   const { data: existing } = await supabase
@@ -1171,6 +1204,7 @@ app.post("/verify-identity", async (req, res) => {
   const updateData = {};
   if (selfie_url) updateData.selfie_url = selfie_url;
   if (id_document_url) updateData.id_document_url = id_document_url;
+  if (id_document_url && id_document_type) updateData.id_document_type = id_document_type;
 
   if (Object.keys(updateData).length > 0) {
     const { error } = await supabase.from("workers").update(updateData).eq("email", email);
@@ -1201,6 +1235,15 @@ app.post("/payment/initialize", async (req, res) => {
   }
   if (!shift_data) {
     return res.status(400).json({ success: false, message: "shift_data is required." });
+  }
+
+  if (!hasVerifiedContact(user)) {
+    return res.status(403).json({ success: false, code: "contact_unverified", message: "Please verify your email and phone number before continuing." });
+  }
+
+  const posterActivated = await getPosterActivation(user.email);
+  if (!posterActivated) {
+    return res.status(403).json({ success: false, code: "not_activated", message: "Your account must be activated by an admin before you can post shifts." });
   }
 
   const { facilityTotal } = computeShiftAmounts(shift_data);
@@ -1431,9 +1474,13 @@ app.post("/shift/accept", async (req, res) => {
     return res.status(400).json({ success: false, message: "shift_id and worker_id are required." });
   }
 
+  if (!hasVerifiedContact(user)) {
+    return res.status(403).json({ success: false, code: "contact_unverified", message: "Please verify your email and phone number before continuing." });
+  }
+
   const { data: worker, error: workerError } = await supabase
     .from("workers")
-    .select("id, full_name, email, phone, role, license_verified, identity_verified")
+    .select("id, full_name, email, phone, role, license_verified, identity_verified, activated")
     .eq("id", workerId)
     .single();
 
@@ -1483,12 +1530,8 @@ app.post("/shift/accept", async (req, res) => {
     return res.status(400).json({ success: false, message: "This shift has not been paid for yet." });
   }
 
-  if (!worker.identity_verified) {
-    return res.status(400).json({ success: false, message: "Complete identity verification before accepting shifts." });
-  }
-
-  if (isPharmacyRole(shift.role_needed) && !worker.license_verified) {
-    return res.status(400).json({ success: false, message: "License verification is required for pharmacy shifts." });
+  if (!worker.activated) {
+    return res.status(400).json({ success: false, code: "not_activated", message: "Your account must be activated by an admin before you can accept shifts." });
   }
 
   const qrToken = generateQrToken();
@@ -1950,14 +1993,22 @@ app.post("/applications/apply", async (req, res) => {
     return res.status(400).json({ success: false, message: "worker_id and shift_id are required." });
   }
 
+  if (!hasVerifiedContact(user)) {
+    return res.status(403).json({ success: false, code: "contact_unverified", message: "Please verify your email and phone number before continuing." });
+  }
+
   const { data: worker } = await supabase
     .from("workers")
-    .select("id, email")
+    .select("id, email, activated")
     .eq("id", worker_id)
     .single();
 
   if (!worker || worker.email.toLowerCase() !== user.email.toLowerCase()) {
     return res.status(403).json({ success: false, message: "You can only apply on behalf of your own worker profile." });
+  }
+
+  if (!worker.activated) {
+    return res.status(400).json({ success: false, code: "not_activated", message: "Your account must be activated by an admin before you can apply to shifts." });
   }
 
   const { data: shift } = await supabase
@@ -2070,6 +2121,10 @@ app.post("/applications/accept", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
+  if (!hasVerifiedContact(user)) {
+    return res.status(403).json({ success: false, code: "contact_unverified", message: "Please verify your email and phone number before continuing." });
+  }
+
   const { application_id, facility_email } = req.body;
 
   if (!application_id || !facility_email) {
@@ -2092,6 +2147,10 @@ app.post("/applications/accept", async (req, res) => {
 
   if (user.email.toLowerCase() !== facility_email.toLowerCase()) {
     return res.status(403).json({ success: false, message: "You can only accept applications for your own shifts." });
+  }
+
+  if (!application.workers?.activated) {
+    return res.status(400).json({ success: false, code: "not_activated", message: "This worker's account has not yet been activated by an admin." });
   }
 
   const { data, error } = await supabase
@@ -2814,6 +2873,78 @@ app.post("/admin/activate-worker", async (req, res) => {
   return res.json({ success: true, message: "Worker activated successfully." });
 });
 
+app.post("/admin/activate-facility", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { facility_id } = req.body;
+  if (!facility_id) {
+    return res.status(400).json({ success: false, message: "facility_id is required." });
+  }
+
+  const { error } = await supabase
+    .from("facilities")
+    .update({ activated: true, activated_at: new Date().toISOString() })
+    .eq("id", facility_id);
+
+  if (error) {
+    log("error", "Admin activate facility error", { error: error.message, facility_id });
+    return res.status(500).json({ success: false, message: "Failed to activate facility." });
+  }
+
+  try {
+    const { data: facility } = await supabase.from("facilities").select("email, facility_name").eq("id", facility_id).single();
+    if (facility) {
+      await supabase.from("notifications").insert({
+        email: facility.email,
+        title: "Account activated!",
+        message: `Your account has been reviewed and activated. You can now post shifts.`,
+        type: "account"
+      });
+    }
+  } catch (_) {}
+
+  log("info", "Facility activated by admin", { facility_id, admin: user.email });
+  return res.json({ success: true, message: "Facility activated successfully." });
+});
+
+app.post("/admin/activate-client", async (req, res) => {
+  const user = await requireAuth(req, res);
+  if (!user) return;
+  if (!requireAdmin(req, res)) return;
+
+  const { client_id } = req.body;
+  if (!client_id) {
+    return res.status(400).json({ success: false, message: "client_id is required." });
+  }
+
+  const { error } = await supabase
+    .from("clients")
+    .update({ activated: true, activated_at: new Date().toISOString() })
+    .eq("id", client_id);
+
+  if (error) {
+    log("error", "Admin activate client error", { error: error.message, client_id });
+    return res.status(500).json({ success: false, message: "Failed to activate client." });
+  }
+
+  try {
+    const { data: client } = await supabase.from("clients").select("email, full_name").eq("id", client_id).single();
+    if (client) {
+      await supabase.from("notifications").insert({
+        email: client.email,
+        title: "Account activated!",
+        message: `Your account has been reviewed and activated. You can now book professionals.`,
+        type: "account"
+      });
+    }
+  } catch (_) {}
+
+  log("info", "Client activated by admin", { client_id, admin: user.email });
+  return res.json({ success: true, message: "Client activated successfully." });
+});
+
 // ── Admin: approve facility for postpaid billing ──
 app.post("/admin/approve-facility", async (req, res) => {
   const user = await requireAuth(req, res);
@@ -3201,11 +3332,11 @@ app.put("/worker", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
-  const { full_name, phone, role, license_number, city, country, experience, profile_photo_url, bio, license_file_url } = req.body;
+  const { full_name, phone, role, license_number, city, country, experience, profile_photo_url, bio, license_file_url, license_verification_token } = req.body;
 
   const { data: existing } = await supabase
     .from("workers")
-    .select("id")
+    .select("id, full_name, role, country")
     .eq("email", user.email)
     .maybeSingle();
 
@@ -3224,6 +3355,19 @@ app.put("/worker", async (req, res) => {
   if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
   if (bio !== undefined) updates.bio = sanitize(bio);
   if (license_file_url) updates.license_file_url = license_file_url;
+
+  // License verification now happens from the dashboard (not signup): the
+  // client calls GET /verify first, then presents the resulting signed
+  // receipt here, same trust model as POST /worker used at signup.
+  if (license_number && license_verification_token) {
+    const licenseAutoVerified = verifyLicenseVerificationToken(license_verification_token, {
+      registration_number: license_number,
+      name: full_name || existing.full_name,
+      country: country || existing.country,
+      role: role || existing.role
+    });
+    updates.license_verified = !!licenseAutoVerified;
+  }
 
   const { error } = await supabase.from("workers").update(updates).eq("id", existing.id);
 
@@ -5350,6 +5494,10 @@ app.post("/invitations/respond", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
 
+  if (!hasVerifiedContact(user)) {
+    return res.status(403).json({ success: false, code: "contact_unverified", message: "Please verify your email and phone number before continuing." });
+  }
+
   try {
     const application_id = sanitize(req.body.application_id);
     const response = sanitize(req.body.response);
@@ -5360,12 +5508,16 @@ app.post("/invitations/respond", async (req, res) => {
 
     const { data: worker } = await supabase
       .from("workers")
-      .select("id, full_name")
+      .select("id, full_name, activated")
       .eq("email", user.email)
       .maybeSingle();
 
     if (!worker) {
       return res.status(404).json({ success: false, message: "Worker profile not found." });
+    }
+
+    if (response === "accepted" && !worker.activated) {
+      return res.status(400).json({ success: false, code: "not_activated", message: "Your account must be activated by an admin before you can accept shifts." });
     }
 
     const { data: application } = await supabase
@@ -5611,7 +5763,7 @@ app.get("/settings/facility", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
   try {
-    const { data: facility, error } = await supabase.from("facilities").select("id, facility_name, facility_type, city, contact_name, contact_phone, staff_needs, billing_model, trusted_by, created_at, updated_at").eq("email", user.email.toLowerCase()).maybeSingle();
+    const { data: facility, error } = await supabase.from("facilities").select("id, facility_name, facility_type, city, contact_name, phone, staff_needs, billing_model, trusted_by, created_at, updated_at").eq("email", user.email.toLowerCase()).maybeSingle();
     if (error || !facility) return res.status(404).json({ success: false, message: "Facility not found." });
     return res.json({ success: true, data: facility });
   } catch (err) {
@@ -5624,13 +5776,13 @@ app.put("/settings/facility", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
   try {
-    const { facility_name, facility_type, city, contact_name, contact_phone, staff_needs } = req.body;
+    const { facility_name, facility_type, city, contact_name, phone, staff_needs } = req.body;
     const updates = {};
     if (facility_name) updates.facility_name = sanitize(facility_name);
     if (facility_type) updates.facility_type = sanitize(facility_type);
     if (city) updates.city = sanitize(city);
     if (contact_name) updates.contact_name = sanitize(contact_name);
-    if (contact_phone) updates.contact_phone = sanitize(contact_phone);
+    if (phone) updates.phone = sanitize(phone);
     if (staff_needs) updates.staff_needs = sanitize(staff_needs);
     const { data: facility, error } = await supabase.from("facilities").update(updates).eq("email", user.email.toLowerCase()).select().single();
     if (error) return res.status(500).json({ success: false, message: "Failed to update facility." });
@@ -5888,9 +6040,12 @@ app.get("/client", async (req, res) => {
 app.put("/client", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
-  const { full_name, phone, city, country, address, gps_code, gender, profile_photo_url } = req.body;
+  const { full_name, phone, city, country, address, gps_code, gender, profile_photo_url, id_document_url, id_document_type } = req.body;
   if (!full_name || !phone || !city) {
     return res.status(400).json({ success: false, message: "Name, phone, and city are required." });
+  }
+  if (id_document_url && !["government_id", "passport"].includes(id_document_type)) {
+    return res.status(400).json({ success: false, message: "id_document_type must be government_id or passport." });
   }
   try {
     const { data: existing } = await supabase.from("clients")
@@ -5904,6 +6059,8 @@ app.put("/client", async (req, res) => {
     if (address !== undefined) updates.address = sanitize(address);
     if (gps_code !== undefined) updates.gps_code = sanitize(gps_code);
     if (profile_photo_url) updates.profile_photo_url = profile_photo_url;
+    if (id_document_url) updates.id_document_url = id_document_url;
+    if (id_document_url && id_document_type) updates.id_document_type = id_document_type;
 
     let { error } = await supabase.from("clients").update(updates).eq("id", existing.id);
     // If update failed, retry with only basic fields (newer columns may not exist yet)
