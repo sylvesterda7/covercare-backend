@@ -219,12 +219,39 @@ function pickShiftFields(data) {
   return picked;
 }
 
+// Country is a property of the account (captured once at signup), not
+// something re-entered per shift — looks up the country of the facility or
+// individual client that owns this email so every shift can be attributed
+// to a country for admin grouping/finance without any new form field.
+async function getPosterCountry(email) {
+  if (!email) return null;
+  const lower = email.toLowerCase();
+
+  const { data: facility } = await supabase
+    .from("facilities")
+    .select("country")
+    .eq("email", lower)
+    .maybeSingle();
+  if (facility?.country) return facility.country;
+
+  const { data: client } = await supabase
+    .from("clients")
+    .select("country")
+    .eq("email", lower)
+    .maybeSingle();
+  return client?.country || null;
+}
+
 // Insert a shift posting as N rows (one per professional needed) so each
 // spot flows through the existing single-worker apply/accept/QR/payout
 // machinery unchanged. Each row carries the per-worker total_pay; siblings
 // reference the first row via parent_shift_id (informational). Falls back
 // to plain inserts if the parent_shift_id column doesn't exist yet.
 async function insertShiftRows(shiftFields) {
+  if (!shiftFields.country) {
+    shiftFields.country = await getPosterCountry(shiftFields.contact_email);
+  }
+
   const workers = parseInt(shiftFields.workers_needed, 10) || 1;
   const { workerTotal } = computeShiftAmounts(shiftFields);
   const perWorkerPay = Math.round((workerTotal / workers) * 100) / 100;
@@ -2813,36 +2840,62 @@ app.get("/finance/admin/summary", async (req, res) => {
   if (!user) return;
   if (!requireAdmin(req, res)) return;
   try {
-    const { data: shifts } = await supabase.from("shifts").select("total_pay, payment_status, facility_credit, contact_email, created_at");
+    const { data: shifts } = await supabase.from("shifts").select("total_pay, payment_status, facility_credit, contact_email, created_at, country");
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    let total_revenue = 0, pending_postpaid = 0, total_credits = 0, this_month_revenue = 0;
-    const facilitySet = new Set();
+
+    function blankTotals() {
+      return { total_revenue: 0, pending_postpaid: 0, total_credits: 0, total_shifts: 0, this_month_revenue: 0, facilitySet: new Set() };
+    }
+    function finalize(t) {
+      return {
+        total_revenue: Math.round(t.total_revenue * 100) / 100,
+        pending_postpaid: Math.round(t.pending_postpaid * 100) / 100,
+        total_credits: Math.round(t.total_credits * 100) / 100,
+        total_shifts: t.total_shifts,
+        total_facilities: t.facilitySet.size,
+        this_month_revenue: Math.round(t.this_month_revenue * 100) / 100
+      };
+    }
+
+    const overall = blankTotals();
+    const byCountry = {};
+
     for (const s of shifts || []) {
       const facilityTotal = Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100;
-      if (s.payment_status === "paid") {
-        total_revenue += facilityTotal;
-        if (s.created_at && s.created_at >= monthStart) {
-          this_month_revenue += facilityTotal;
+      // Shifts posted before country was tracked (or whose poster has no
+      // country on file) are bucketed separately rather than dropped, so the
+      // per-country breakdown always accounts for every shift with no ambiguity.
+      const countryKey = s.country || "unknown";
+      if (!byCountry[countryKey]) byCountry[countryKey] = blankTotals();
+      const bucket = byCountry[countryKey];
+
+      for (const totals of [overall, bucket]) {
+        totals.total_shifts += 1;
+        if (s.payment_status === "paid") {
+          totals.total_revenue += facilityTotal;
+          if (s.created_at && s.created_at >= monthStart) {
+            totals.this_month_revenue += facilityTotal;
+          }
         }
+        if (s.payment_status === "postpaid") {
+          totals.pending_postpaid += facilityTotal;
+        }
+        if (s.facility_credit) {
+          totals.total_credits += parseFloat(s.facility_credit) || 0;
+        }
+        if (s.contact_email) totals.facilitySet.add(s.contact_email);
       }
-      if (s.payment_status === "postpaid") {
-        pending_postpaid += facilityTotal;
-      }
-      if (s.facility_credit) {
-        total_credits += parseFloat(s.facility_credit) || 0;
-      }
-      if (s.contact_email) facilitySet.add(s.contact_email);
     }
+
+    const by_country = {};
+    Object.keys(byCountry).sort().forEach(k => { by_country[k] = finalize(byCountry[k]); });
+
     return res.json({
       success: true,
       data: {
-        total_revenue: Math.round(total_revenue * 100) / 100,
-        pending_postpaid: Math.round(pending_postpaid * 100) / 100,
-        total_credits: Math.round(total_credits * 100) / 100,
-        total_shifts: (shifts || []).length,
-        total_facilities: facilitySet.size,
-        this_month_revenue: Math.round(this_month_revenue * 100) / 100
+        ...finalize(overall),
+        by_country
       }
     });
   } catch (err) {
@@ -2860,9 +2913,24 @@ app.get("/finance/admin/transactions", async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const offset = (page - 1) * limit;
-    const { count, error: countError } = await supabase.from("shifts").select("*", { count: "exact", head: true });
+    const countryFilter = sanitize(req.query.country || "");
+
+    let countQuery = supabase.from("shifts").select("*", { count: "exact", head: true });
+    let dataQuery = supabase.from("shifts").select("*").order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+    if (countryFilter && countryFilter !== "all") {
+      const eqValue = countryFilter === "unknown" ? null : countryFilter;
+      if (eqValue === null) {
+        countQuery = countQuery.is("country", null);
+        dataQuery = dataQuery.is("country", null);
+      } else {
+        countQuery = countQuery.eq("country", eqValue);
+        dataQuery = dataQuery.eq("country", eqValue);
+      }
+    }
+
+    const { count, error: countError } = await countQuery;
     if (countError) return res.status(500).json({ success: false, message: "Failed to count transactions." });
-    const { data: shifts, error } = await supabase.from("shifts").select("*").order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+    const { data: shifts, error } = await dataQuery;
     if (error) return res.status(500).json({ success: false, message: "Failed to load transactions." });
     const transactions = (shifts || []).map(s => ({
       id: s.id,
@@ -2870,6 +2938,7 @@ app.get("/finance/admin/transactions", async (req, res) => {
       contact_email: s.contact_email,
       role_needed: s.role_needed,
       shift_date: s.shift_date,
+      country: s.country || "unknown",
       total_pay: parsePayAmount(s.total_pay),
       facility_total: Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100,
       payment_status: s.payment_status,
@@ -2940,6 +3009,7 @@ app.get("/admin/payments", async (req, res) => {
       shift_date: s.shift_date,
       start_time: s.start_time,
       duration: s.duration,
+      country: s.country || "unknown",
       total_pay: parsePayAmount(s.total_pay),
       facility_total: Math.round(parsePayAmount(s.total_pay) * 1.25 * 100) / 100,
       payment_status: s.payment_status,
@@ -3143,7 +3213,7 @@ app.get("/shifts/open", async (req, res) => {
   const workerRole = worker ? normalizeWorkerRole(worker.role) : null;
   const workerId = worker?.id || null;
 
-  const SELECT_COLS = "id, facility_name, role_needed, city, shift_date, start_time, duration, duration_hours, days_needed, workers_needed, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
+  const SELECT_COLS = "id, facility_name, role_needed, city, country, shift_date, start_time, duration, duration_hours, days_needed, workers_needed, pay_rate, urgency, status, branch_id, assigned_to_worker_id, contact_email, created_at";
 
   let openQuery = supabase.from("shifts").select(SELECT_COLS).eq("status", "open");
   if (workerRole) openQuery = openQuery.eq("role_needed", workerRole);
