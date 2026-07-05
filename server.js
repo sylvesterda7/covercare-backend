@@ -16,6 +16,15 @@ const ADMINS = (process.env.ADMIN_EMAILS || "sdenyoh-abayateye@st.ug.edu.gh")
   .split(",")
   .map(e => e.trim().toLowerCase());
 
+// ── Contact-verification policy ──
+// When true, an account must have BOTH email and phone confirmed (Supabase
+// Auth) before it can use the platform. When false, only email is required —
+// the phone number is still collected at signup, just not OTP-verified yet.
+// Flip this to true (and CC_CONFIG.REQUIRE_PHONE_VERIFICATION in the frontend
+// config.js) to turn phone verification back on. All the phone-OTP code stays
+// in place either way. This does NOT affect the separate admin-activation gate.
+const REQUIRE_PHONE_VERIFICATION = false;
+
 // ── License verification receipts ──
 // /verify performs a real, server-side lookup against the professional
 // regulator (e.g. PC Ghana) and, on a genuine match, signs a short-lived
@@ -242,11 +251,14 @@ async function getPosterCountry(email) {
   return client?.country || null;
 }
 
-// Gate 1: an account can only use the platform once BOTH its email and
-// phone are confirmed with Supabase Auth. This reads straight off the auth
-// user object requireAuth already fetched — no domain-table column needed.
+// Gate 1: an account can only use the platform once its contact details are
+// confirmed with Supabase Auth. Email is always required; phone is required
+// only when REQUIRE_PHONE_VERIFICATION is on (see the constant above). Reads
+// straight off the auth user object requireAuth already fetched.
 function hasVerifiedContact(user) {
-  return !!(user?.email_confirmed_at && user?.phone_confirmed_at);
+  if (!user?.email_confirmed_at) return false;
+  if (REQUIRE_PHONE_VERIFICATION && !user?.phone_confirmed_at) return false;
+  return true;
 }
 
 // Gate 2: whether the posting facility/client has been reviewed and
