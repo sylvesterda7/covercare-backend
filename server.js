@@ -1500,6 +1500,10 @@ app.post("/shift/accept", async (req, res) => {
     return res.status(404).json({ success: false, message: "Worker not found." });
   }
 
+  if (worker.email.toLowerCase() !== user.email.toLowerCase()) {
+    return res.status(403).json({ success: false, message: "You can only accept shifts on behalf of your own worker profile." });
+  }
+
   const shift = await getShiftById(shiftId);
   if (!shift) {
     return res.status(404).json({ success: false, message: "Shift not found." });
@@ -5913,7 +5917,7 @@ app.get("/workers/search", async (req, res) => {
   if (!user) return;
   const { role, city, q } = req.query;
   try {
-    let query = supabase.from("workers").select("id, full_name, email, phone, role, city, experience, profile_photo_url, license_verified, identity_verified");
+    let query = supabase.from("workers").select("id, full_name, role, city, experience, profile_photo_url, license_verified, identity_verified");
     if (role) query = query.eq("role", role);
     if (city) query = query.eq("city", city);
     if (q) query = query.or(`full_name.ilike.%${q}%,email.ilike.%${q}%`);
